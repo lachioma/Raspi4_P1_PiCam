@@ -8,11 +8,11 @@ Description=Raspi4 P1 + RGB camera field recorder (thermal + detection + RGB eve
 Type=simple
 User=ale
 WorkingDirectory=/home/ale/Raspi4_P1_PiCam
-# --rotate-degrees 180 matches the previous single-camera rig's mounting;
-# CONFIRM this against the actual dual-camera bracket before a real
-# deployment - it may not carry over.
+# --thermal-rotate-degrees 180 matches the previous single-camera rig's
+# mounting; CONFIRM this against the actual dual-camera bracket before a
+# real deployment - it may not carry over.
 ExecStart=/home/ale/Raspi4_P1_PiCam/venv/bin/python3 field_recorder.py \
-    --rotate-degrees 180 \
+    --thermal-rotate-degrees 180 \
     --thermal-outdir /home/ale/Raspi4_P1_PiCam/recordings_thermal \
     --rgb-outdir /home/ale/Raspi4_P1_PiCam/recordings_rgb_events \
     --detections-log /home/ale/Raspi4_P1_PiCam/detections_events.jsonl
