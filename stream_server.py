@@ -12,8 +12,8 @@ Confirmed detections are boxed in the thermal stream and appended to
 --detections-log as they happen (one JSON line per finished track). Console
 output (visible via `journalctl` if run as a systemd service) includes a
 stats line every 60s with achieved capture/detection fps and mean detection
-time per frame - watch that during the multi-hour endurance test to see
-whether the Pi is keeping up.
+time per frame - watch that during a multi-hour test to see whether the Pi
+is keeping up.
 
 Detection itself is WildMice/thermal_detect's validated real-time detector
 (detect_stream.py + track.py, vendored unmodified) - see live_detection.py
@@ -23,6 +23,144 @@ Example:
 
     python3 stream_server.py --model p1 --rotate-degrees 0 \\
         --rgb-width 640 --rgb-height 480 --rgb-fps 15 --port 8080
+
+Arguments:
+
+  Cameras
+  -------
+  --model {p1,p3}
+      Thermal camera model. Default: p1.
+  --rotate-degrees {0,90,180,270}
+      Clockwise rotation applied to the thermal video/detector. Default: 0.
+  --rgb-rotate-degrees {0,90,180,270}
+      Clockwise rotation applied to the RGB stream - independent of
+      --rotate-degrees, since the two cameras can be mounted at different
+      angles on the same bracket. Default: 0.
+  --rgb-width N
+      RGB capture width, in pixels. Default: 640.
+  --rgb-height N
+      RGB capture height, in pixels. Default: 480.
+  --rgb-fps N
+      RGB capture/publish rate. Resolution and fps aren't independent:
+      picamera2/libcamera first picks the Camera Module 2 sensor mode that
+      best matches --rgb-width/--rgb-height, *then* clamps --rgb-fps to
+      whatever that mode supports - resolution wins, fps is silently capped
+      if it exceeds the chosen mode's ceiling. Default: 15.
+
+  Streaming
+  ---------
+  --thermal-fps N
+      Cap the thermal stream's publish rate (0 = publish every frame at the
+      camera's native ~25-27fps). Like --detect-fps below, a target that
+      isn't an exact sub-multiple of the native rate is rounded down to the
+      nearest one the camera can actually deliver (e.g. 10 becomes a steady
+      8.33fps from a 25fps source - see thermal_source.py's publish-throttle
+      comment). Default: 0.
+  --jpeg-quality N
+      JPEG encode quality (1-100) for both streams. Default: 85.
+  --no-timestamp
+      Disable the burned-in timestamp overlay on both streams.
+  --host ADDRESS
+      HTTP bind address. Default: 0.0.0.0 (all interfaces).
+  --port N
+      HTTP port. Default: 8080.
+  --no-rgb
+      Run thermal-only (skip the Camera Module 2), e.g. to test on hardware
+      where it isn't connected yet.
+  --no-thermal
+      Run RGB-only (skip the P1/P3), e.g. to test the Camera Module 2 in
+      isolation.
+
+  Detection
+  ---------
+  --no-detect
+      Disable the real-time animal detector, e.g. to measure the
+      streaming-only baseline CPU load before comparing it against
+      detection enabled.
+  --detect-fps N
+      Rate the thermal stream (native ~25-27fps) is thinned down to before
+      being fed to the detector - see the --thermal-fps note above about
+      rounding. Default: 10.
+  --detections-log PATH
+      JSON-lines file finished detection events are appended to. Default:
+      detections_events.jsonl.
+
+  Detection tuning (detect_stream.py's StreamConfig - see live_detection.py
+  and WildMice/thermal_detect/README.md's "Real-time detection on the
+  Raspberry Pi" section for the full rationale behind each one)
+  -----------------------------------------------------------------------
+  --bg-alpha N
+      Per-frame EMA weight of the newest frame in the background model.
+      0.02 at 10fps gives a ~5s time constant; scales inversely with
+      --detect-fps. Default: 0.02.
+  --noise-alpha N
+      Same idea, for the per-pixel noise-scale EMA - deliberately slower
+      than --bg-alpha so the noise floor doesn't chase a single event.
+      Default: 0.01.
+  --freeze-update {true,false}
+      Don't fold currently-detected pixels into the background/noise EMAs,
+      or an animal that stops moving slowly melts into its own background
+      and the track dies. Default: true.
+  --warmup N
+      Frames to seed the background model before any detection is
+      reported. Default: 50.
+  --min-delta N
+      Minimum absolute intensity rise (0-255) over the background required
+      to call a pixel "hot". Default: 22.0.
+  --sigma-k N
+      The detection threshold is max(--min-delta, --sigma-k x per-pixel
+      noise scale) - this is what makes daytime clutter (sun flecks,
+      wind-shaken vegetation) usable: it demands a stronger signal wherever
+      the scene already flickers. Default: 6.0.
+  --sigma-cap N
+      Ceiling on the per-pixel noise scale, so a pixel an animal happens to
+      occupy cannot desensitise itself. Default: 18.0.
+  --min-mean-delta N
+      Minimum mean intensity rise inside a candidate blob. Default: 25.0.
+  --min-area-frac N
+      Smallest blob size worth considering, as a fraction of frame area (so
+      it survives other resolutions) - 160x120 -> ~4px at the default.
+      Default: 0.0002.
+  --max-area-frac N
+      Largest blob size worth considering; bigger is a lighting change, not
+      an animal. Default: 0.06.
+  --morph-kernel N
+      Size of the morphological open/close kernel used to clean up the
+      threshold mask. Default: 3.
+  --max-blobs N
+      Frames busier than this many simultaneous blobs are treated as a
+      noise burst (e.g. a sudden AGC-wide brightness shift) and discarded
+      outright. Default: 12.
+  --min-track-frames N
+      Hits a track needs before it's considered "reportable" - drawn on the
+      stream and eligible to trigger anything downstream. Default: 3.
+  --min-event-delta N
+      Drop a finished track from --detections-log if its peak intensity
+      rise never reached this. Default: 35.0.
+
+  Tracking tuning (track.py's Kalman tracker - only the six fields
+  detect_stream.py's OnlineTracker actually reads; see LIVE_TRACK_FIELDS in
+  this file for why the rest of track.py's Config isn't exposed here)
+  -----------------------------------------------------------------------
+  --merge-gap N
+      Pixel gap within which separate blobs (e.g. a head blob and a body
+      blob from the same animal) are merged into one detection before
+      tracking. Default: 3.0.
+  --max-dist-frac N
+      Gating distance for matching a detection to a predicted track
+      position, as a fraction of the frame diagonal. Default: 0.16.
+  --iou-weight N
+      How much bounding-box overlap counts against centroid distance in the
+      association cost. Default: 0.5.
+  --max-age N
+      Frames a track keeps predicting through a miss (e.g. the animal
+      pauses or is briefly occluded) before being finalized - 12 frames is
+      ~1.2s at 10fps. Default: 12.
+  --process-var N
+      Process noise (px) for the constant-velocity Kalman filter. Default:
+      4.0.
+  --measure-var N
+      Measurement noise (px) for the same filter. Default: 6.0.
 """
 
 import argparse
@@ -61,7 +199,9 @@ def _add_config_args(group, cfg_instance, fields=None):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--model", choices=[Model.P1, Model.P3], default=Model.P1,
         help="Thermal camera model. Default: p1.",
@@ -83,6 +223,12 @@ def parse_args():
     )
     parser.add_argument(
         "--rgb-fps", type=float, default=15.0, help="RGB capture/publish rate. Default: 15.",
+    )
+    parser.add_argument(
+        "--rgb-rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
+        help="Clockwise rotation applied to the RGB stream - independent of "
+        "--rotate-degrees, since the two cameras can be mounted at different angles "
+        "on the same bracket. Default: 0.",
     )
     parser.add_argument(
         "--jpeg-quality", type=int, default=85,
@@ -185,6 +331,7 @@ def main():
                 width=args.rgb_width,
                 height=args.rgb_height,
                 fps=args.rgb_fps,
+                rotate_degrees=args.rgb_rotate_degrees,
                 jpeg_quality=args.jpeg_quality,
                 show_timestamp=not args.no_timestamp,
             ),

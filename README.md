@@ -5,16 +5,35 @@ top of [p3-ir-camera](../../ClaudeAI/p3-ir-camera). Target hardware:
 Raspberry Pi 4, Thermal Master P1 (USB), Raspberry Pi Camera Module 2 (CSI).
 
 **Step 1: dual-camera acquisition + streaming both video feeds over
-Ethernet.** Done - see "Running" below.
+Ethernet.** Done - see "Running (bench testing)" below.
 
-**Step 2 (this stage): real-time on-board animal detection**, using
+**Step 2: real-time on-board animal detection**, using
 [WildMice/thermal_detect](../WildMice/thermal_detect)'s own validated
 real-time detector (`detect_stream.py` + `track.py`, vendored unmodified -
 not `p3-ir-camera/animal_detector.py`'s earlier sketch, and not this
 project's own first-pass port, which that project's causal pipeline has
-since superseded). Current goal: confirm the Raspberry Pi 4 can run
-detection alongside both camera streams continuously for many hours before
-spending any more effort improving the algorithm itself.
+since superseded). Confirmed running alongside both camera streams on the
+Pi 4 - see "Real-time detection" below.
+
+**Step 3 (this stage): field deployment**, via a second entry point,
+`field_recorder.py` (new files, independent of `stream_server.py` above -
+see "Field deployment" below):
+
+- continuously records the thermal stream to the SD card (segmented, like
+  `p3-ir-camera/record_p1_segmented.py`)
+- runs the detector continuously and boxes confirmed detections directly
+  into the saved thermal video
+- when the detector flags an animal in frame, records an RGB clip covering
+  a few seconds before it appeared and a few seconds after it clears -
+  *not* continuous RGB recording, which the disk budget below rules out
+- deploys with `field_mode.sh`/`normal_mode.sh`, the same field-vs-desk
+  toggle `p3-ir-camera` uses
+
+`stream_server.py` (bench testing, live MJPEG preview over Ethernet) and
+`field_recorder.py` (unattended field deployment, no network) are separate
+entry points sharing the same detection code - use whichever fits what
+you're doing right now; they don't run at the same time on one Pi since
+both want the P1 and the Camera Module 2 exclusively.
 
 ## Setup on the Raspberry Pi
 
@@ -36,6 +55,25 @@ pip install -r requirements.txt
 python3 -c "from picamera2 import Picamera2; print('ok')"  # sanity check
 ```
 
+
+To see the exact modes/ranges available (resolution, frame rate):
+
+```bash
+python3 -c "from picamera2 import Picamera2; print(Picamera2().sensor_modes)"
+```
+
+Try this for a more readable output format:
+
+```
+LIBCAMERA_LOG_LEVELS=*:ERROR python3 << 'EOF'
+from picamera2 import Picamera2
+
+for m in Picamera2().sensor_modes:
+    size = f'{m["size"][0]}x{m["size"][1]}'
+    print(f'{size:<12} {m["fps"]:>7.2f} fps  {m["bit_depth"]:>2}-bit  {m["format"]}')
+EOF
+```
+
 ### USB permissions for the P1
 
 Same udev rule as the original project - see its README - so the camera is
@@ -48,7 +86,7 @@ EOF
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-## Running
+## Running (bench testing)
 
 ```bash
 python3 stream_server.py
@@ -73,7 +111,9 @@ http://192.168.50.2:8080/rgb.mjpg
 Useful flags (`python3 stream_server.py --help` for the full list):
 
 - `--rotate-degrees {0,90,180,270}` - orient the thermal image to match how
-  the P1 is mounted.
+  the P1 is mounted. `--rgb-rotate-degrees` does the same for the RGB
+  stream, independently (the two cameras can be mounted at different angles
+  on the same bracket).
 - `--rgb-width`/`--rgb-height`/`--rgb-fps` - RGB capture resolution/rate
   (default 640x480 @ 15fps; the Camera Module 2 supports much higher, but
   start modest until we know what the direct Ethernet link and the Pi 4's
@@ -152,10 +192,127 @@ stated in `detect_stream.py`'s `StreamConfig` docstring at that rate) -
 changing `--detect-fps` without adjusting them shifts how fast the
 background adapts.
 
+## Field deployment: `field_recorder.py`
+
+A separate entry point from `stream_server.py` - no HTTP/MJPEG, no network
+dependency at all, meant to run unattended for days as a systemd service.
+
+```bash
+python3 field_recorder.py \
+    --rotate-degrees 180 \
+    --thermal-outdir recordings_thermal \
+    --rgb-outdir recordings_rgb_events \
+    --detections-log detections_events.jsonl
+```
+
+### How the RGB trigger works
+
+The thermal side (`thermal_field_recorder.py`) runs the same detector as
+`stream_server.py` continuously, and on every detection cycle tells a shared
+`EventTrigger` (`event_trigger.py`) whether at least one confirmed track is
+currently in frame. The RGB side (`rgb_event_recorder.py`) always captures
+from the Camera Module 2, keeping a rolling buffer of the last
+`--pre-roll-seconds` of frames, but only *writes* a clip while the trigger
+is active - opening a new one by first dumping that buffer (the pre-roll),
+then continuing to record until `--post-roll-seconds` after the trigger
+clears. A second animal appearing before the post-roll timer elapses just
+extends the same clip rather than starting a new one, so a bust of activity
+becomes one continuous recording instead of several clipped fragments.
+
+The two sides only share that one boolean-plus-timestamp signal - not
+discrete "event N started/stopped" messages - deliberately: the two cameras
+run at different, independently-varying frame rates and can each stall or
+reconnect on their own, so coupling them through a message queue would need
+its own retry/ordering logic that a simple shared state doesn't.
+
+Each RGB clip gets a `.json` sidecar (start/end time, frame count, why it
+closed). To see *why* a given clip was triggered, cross-reference its
+`clip_started_at`/`clip_ended_at` window against `detections_events.jsonl`'s
+timestamps - the two aren't line-linked by design, since one clip can span
+several finished tracks (and the software doesn't currently write the
+track id(s) into the clip's sidecar; worth adding if reviewing becomes
+tedious - see "What's next").
+
+### Disk, CPU, and RAM budget
+
+**RAM**: the RGB pre-roll buffer is the only new memory cost, and it's
+small: at the defaults (640x480 BGR @ 15fps, 2s pre-roll) that's
+`640 x 480 x 3 bytes x 15fps x 2s` ≈ 27MB. Trivial on any Pi 4 (1GB+).
+
+**CPU**: detection's own cost was already measured on real hardware during
+the step-2 endurance test - see the "Real-time detection" section's stats
+line and WildMice's own benchmark (0.24ms/frame on their server, 30-80x
+headroom estimated on a Pi 4). Recording is comparatively cheap: the
+thermal segment writer only handles 160x120 frames, and the RGB event
+writer only runs `cv2.VideoWriter` while a clip is actually open (i.e.
+rarely, unless the camera is pointed at constant activity) - it is not a
+continuous cost like detection is.
+
+**Disk - the part that actually needs sizing.** Two independent write
+streams, deliberately given different growth characteristics:
+
+- **Thermal (continuous, unconditional)**: fixed cost, roughly proportional
+  to `--thermal-fps x hours x scene compressibility` - a static night scene
+  compresses far better than a busy daytime one, so treat any single number
+  as an order-of-magnitude estimate, not a guarantee. **Verify it directly**:
+  run `field_recorder.py` for 10-15 minutes, check the resulting segment
+  file's size in `--thermal-outdir`, and scale linearly to a full day/week -
+  this is more reliable than any figure quoted here, and costs nothing since
+  the detector needs a real test run anyway. `--save-raw` roughly doubles
+  video-only figures and adds a fixed, content-independent cost on top
+  (resolution x 2 bytes x fps x seconds - see `segment_writer.py`'s
+  docstring) - left off by default here specifically because this variant
+  already spends part of the disk budget on RGB clips.
+- **RGB (event-triggered only)**: proportional to *how much wildlife
+  activity actually happens*, not to how long the recorder runs - an
+  otherwise-quiet deployment costs almost nothing here regardless of
+  `--rgb-width`/`--rgb-height`/`--rgb-fps`, which is the entire reason
+  continuous RGB recording was ruled out for a multi-day deployment.
+
+Two safety nets, deliberately asymmetric so a burst of RGB events can't
+starve the more essential thermal record: `--thermal-min-free-mb` (default
+500) stops the *entire process* if crossed, while `--rgb-min-free-mb`
+(default 1000, i.e. it trips first) only skips starting *new* RGB clips -
+thermal recording and detection keep running regardless. If a real
+deployment's SD card is small relative to expected activity, lower
+`--rgb-width`/`--rgb-height`/`--rgb-fps` or raise `--rgb-min-free-mb`
+before shortening `--segment-seconds` or touching the thermal-side
+settings, which are the deployment's core, always-on record.
+
+### Field mode
+
+Same pattern as `p3-ir-camera`'s `field_mode.sh`/`normal_mode.sh`, pointed
+at a new `field-recorder.service` instead of `thermal-recorder.service`
+(both scripts and both `.service` files are vendored fresh here so this
+project doesn't depend on the other checkout being present on the Pi):
+
+```bash
+sudo cp field-recorder.service field-mode-net.service /etc/systemd/system/
+sudo systemctl daemon-reload
+./field_mode.sh     # disables Wi-Fi/BT/Ethernet, switches to console boot, starts the recorder
+# ... later, to get the desktop and networking back for debugging ...
+./normal_mode.sh
+```
+
+**Before a real deployment**, check `field-recorder.service`'s
+`--rotate-degrees 180`: that value carried over from the single-camera
+rig's known mounting, and may not hold for the new dual-camera bracket.
+
 ## Project layout
+
+Shared by both entry points:
 
 - `p3_camera.py` - vendored USB driver for the P1/P3 (copied from
   p3-ir-camera; not modified here - port fixes back manually if needed).
+- `detect_stream.py`, `track.py` - vendored unmodified from
+  `WildMice/thermal_detect` - the validated real-time detector and its
+  Kalman tracker. Update by re-copying from there, not by editing here.
+- `live_detection.py` - this project's adapter: wraps the vendored code's
+  `StreamDetector`/`OnlineTracker` in a `LiveDetector.process(frame)` call
+  suited to a persistent camera loop, plus an append-only JSONL event log.
+
+`stream_server.py` (bench testing, live MJPEG preview):
+
 - `thermal_source.py` - thermal capture loop (reconnect-on-error, same
   pattern as `record_p1_segmented.py`); runs detection on every throttled
   frame and publishes annotated JPEGs to a `FrameBus`.
@@ -167,20 +324,50 @@ background adapts.
 - `overlay.py` - shared burned-in timestamp drawing, used by both sources.
 - `stream_server.py` - entry point; wires both capture threads, the HTTP
   server, and the detector's CLI flags together.
-- `detect_stream.py`, `track.py` - vendored unmodified from
-  `WildMice/thermal_detect` - the validated real-time detector and its
-  Kalman tracker. Update by re-copying from there, not by editing here.
-- `live_detection.py` - this project's adapter: wraps the vendored code's
-  `StreamDetector`/`OnlineTracker` in a `LiveDetector.process(frame)` call
-  suited to a persistent camera loop, plus an append-only JSONL event log.
+
+`field_recorder.py` (unattended field deployment):
+
+- `segment_writer.py` - continuous segmented thermal video writer, adapted
+  from `p3-ir-camera/record_p1_segmented.py`'s `SegmentWriter` (now takes
+  width/height as parameters instead of assuming the P1, and can draw
+  detection overlay boxes onto the saved video, not only a live preview).
+- `event_trigger.py` - the thread-safe active/last-active-time signal
+  described above.
+- `rgb_event_recorder.py` - Camera Module 2 capture with a rolling pre-roll
+  buffer and an event-triggered `cv2.VideoWriter` (pre/post-roll), driven
+  by `EventTrigger`.
+- `thermal_field_recorder.py` - thermal capture loop: continuous
+  `SegmentWriter` recording, continuous detection, `EventTrigger` updates,
+  and JSONL event logging, all on one frame stream.
+- `field_recorder.py` - entry point; wires both capture threads and the
+  shared `EventTrigger` together (no HTTP server).
+- `field-recorder.service`, `field-mode-net.service`, `field_mode.sh`,
+  `normal_mode.sh` - field deployment, same pattern as `p3-ir-camera`.
+- `diskspace.py` - the shared free-space check both writers use.
 
 ## What's next
 
+For `stream_server.py`:
+
 - If the endurance test surfaces a CPU/latency problem, look at lowering
   `--detect-fps`, the RGB resolution/fps, or JPEG quality first.
-- Mark/annotate the RGB stream too when a detection is confirmed (currently
-  thermal-only).
 - Revisit streaming efficiency (e.g. hardware H.264 via RTSP) if MJPEG
   bandwidth/CPU becomes a bottleneck once detection is also running.
+
+For `field_recorder.py`:
+
+- Verify the real thermal segment file size/hour on the actual deployment
+  hardware (see the disk budget above) and size `--thermal-min-free-mb` /
+  the SD card against it before a real multi-day deployment.
+- Write the triggering track id(s) into each RGB clip's `.json` sidecar,
+  instead of relying on cross-referencing timestamps against
+  `detections_events.jsonl`, if reviewing footage later turns out to need it.
+- Confirm `--rotate-degrees` (thermal) and `--rgb-rotate-degrees` (RGB,
+  independent of the thermal one since the two cameras can be mounted at
+  different angles) against the actual dual-camera bracket once it's built,
+  rather than assuming the old single-camera rig's value.
+
+For both:
+
 - If `detect_stream.py`/`track.py` change again upstream, re-copy both files
   wholesale rather than patching around the vendored copies.

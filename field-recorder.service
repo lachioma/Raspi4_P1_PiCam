@@ -1,0 +1,26 @@
+[Unit]
+Description=Raspi4 P1 + RGB camera field recorder (thermal + detection + RGB events)
+# No After=network.target: this has no network dependency at all, and the
+# thermal capture loop already retries its own USB connection on its own if
+# the camera hasn't enumerated yet when this starts.
+
+[Service]
+Type=simple
+User=ale
+WorkingDirectory=/home/ale/Raspi4_P1_PiCam
+# --rotate-degrees 180 matches the previous single-camera rig's mounting;
+# CONFIRM this against the actual dual-camera bracket before a real
+# deployment - it may not carry over.
+ExecStart=/home/ale/Raspi4_P1_PiCam/venv/bin/python3 field_recorder.py \
+    --rotate-degrees 180 \
+    --thermal-outdir /home/ale/Raspi4_P1_PiCam/recordings_thermal \
+    --rgb-outdir /home/ale/Raspi4_P1_PiCam/recordings_rgb_events \
+    --detections-log /home/ale/Raspi4_P1_PiCam/detections_events.jsonl
+Restart=always
+RestartSec=10
+# Give systemd time to deliver SIGTERM and let the current segment/clip
+# close cleanly before it escalates to SIGKILL.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

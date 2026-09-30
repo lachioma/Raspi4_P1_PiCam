@@ -14,6 +14,16 @@ import cv2
 from frame_bus import FrameBus
 from overlay import draw_timestamp
 
+# cv2.rotate() codes, keyed by clockwise rotation in degrees - same convention
+# as thermal_source.py's, kept local since the two cameras rotate independently
+# (they can be mounted at different angles on the same bracket).
+ROTATE_CODES = {
+    0: None,
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
 
 def run(
     bus: FrameBus,
@@ -21,6 +31,7 @@ def run(
     width: int = 640,
     height: int = 480,
     fps: float = 15.0,
+    rotate_degrees: int = 0,
     jpeg_quality: int = 85,
     show_timestamp: bool = True,
 ):
@@ -34,8 +45,10 @@ def run(
     )
     picam2.configure(config)
     picam2.start()
-    print(f"[rgb] Camera Module 2 started at {width}x{height} @ {fps}fps.")
+    print(f"[rgb] Camera Module 2 started at {width}x{height} @ {fps}fps "
+          f"(rotate {rotate_degrees}deg).")
 
+    rotate_code = ROTATE_CODES[rotate_degrees]
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
 
     try:
@@ -45,6 +58,8 @@ def run(
             # no extra throttling needed (unlike the thermal source, whose
             # camera streams at its own fixed hardware rate).
             bgr = picam2.capture_array()
+            if rotate_code is not None:
+                bgr = cv2.rotate(bgr, rotate_code)
             now = time.time()
             if show_timestamp:
                 draw_timestamp(bgr, now)

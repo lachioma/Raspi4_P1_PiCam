@@ -68,8 +68,15 @@ def make_handler(thermal_bus: FrameBus, rgb_bus: FrameBus):
                     self.end_headers()
                     self.wfile.write(jpg)
                     self.wfile.write(b"\r\n")
-            except (BrokenPipeError, ConnectionResetError, TimeoutError):
-                pass  # client disconnected; nothing more to do
+            except OSError:
+                # Any socket-level failure means the same thing here: the client is
+                # gone, nothing more to send. BrokenPipeError/ConnectionResetError/
+                # TimeoutError are the common cases, but a flaky link (e.g. the
+                # client's interface briefly losing its route) can also surface as
+                # a plain OSError (errno ENETUNREACH) that isn't one of those named
+                # subclasses - catch OSError itself so it doesn't print an unhandled
+                # traceback for what is, from here, an ordinary disconnect.
+                pass
             finally:
                 print(f"[http] client {self.client_address[0]} disconnected from /{name}")
 

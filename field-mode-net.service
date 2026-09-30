@@ -1,0 +1,16 @@
+[Unit]
+Description=Disable wired Ethernet for field-mode power saving
+After=sys-subsystem-net-devices-eth0.device
+Wants=sys-subsystem-net-devices-eth0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# RemainAfterExit=yes makes "systemctl disable --now" run ExecStop on its
+# way down, so stopping this service is exactly "turn Ethernet back on" -
+# normal_mode.sh doesn't need a separate `ip link up` command.
+ExecStart=/sbin/ip link set eth0 down
+ExecStop=/sbin/ip link set eth0 up
+
+[Install]
+WantedBy=multi-user.target
