@@ -74,6 +74,49 @@ for m in Picamera2().sensor_modes:
 EOF
 ```
 
+For Pi camera module 2, this should give you the following:
+
+```
+640x480       200.16 fps  10-bit  SRGGB10_CSI2P
+1640x1232      81.07 fps  10-bit  SRGGB10_CSI2P
+1920x1080      47.57 fps  10-bit  SRGGB10_CSI2P
+3280x2464      21.19 fps  10-bit  SRGGB10_CSI2P
+640x480       200.16 fps   8-bit  SRGGB8
+1640x1232      81.07 fps   8-bit  SRGGB8
+1920x1080      47.57 fps   8-bit  SRGGB8
+3280x2464      21.19 fps   8-bit  SRGGB8
+```
+
+Each size is really 4 combinations (8-bit or 10-bit RAW, same size/fps/FOV/binning
+either way - the bit depth only affects tonal precision of the raw sensor data
+feeding the ISP, which is otherwise irrelevant here since this project only ever
+consumes picamera2's already-ISP-processed `BGR888` output, never the raw stream
+directly). Binning and field of view aren't reported directly by `sensor_modes`,
+but are derivable from comparing each mode's `crop_limits` (the sensor-pixel
+window read out, before scaling to `size`) against `size` itself and against the
+full sensor (3280x2464):
+
+| size | crop window | binning | field of view | max fps |
+|---|---|---|---|---|
+| 640x480 | 1280x960 | 2x2 | cropped (1280x960 of 3280x2464) | 200.16 |
+| 1640x1232 | 3280x2464 | 2x2 | full sensor | 81.07 |
+| 1920x1080 | 1920x1080 | none | cropped (1920x1080 of 3280x2464) | 47.57 |
+| 3280x2464 | 3280x2464 | none | full sensor | 21.19 |
+
+Picking a mode is a straight resolution/fps/FOV tradeoff: only 1640x1232 and
+3280x2464 use the whole sensor - 640x480 and 1920x1080 both narrow the field of
+view to get there, not just resolution. `--rgb-width`/`--rgb-height` picks the
+mode (whichever one best matches your requested size), and `--rgb-fps` is then
+clamped to that mode's own ceiling - see "RGB event recording"'s `--rgb-fps`
+entry in `field_recorder.py`'s docstring (and `stream_server.py`'s) for how that
+clamping works. There is no way to request an arbitrary binning factor (e.g.
+4x4) - these four modes are the complete, fixed set the Raspberry Pi kernel
+driver exposes for this sensor; a similar full-FOV, lower-resolution result can
+be approximated by taking the 1640x1232 mode and downscaling further in
+software, though that trades away the noise benefit of binning done on-sensor
+before quantization.
+
+
 ### USB permissions for the P1
 
 Same udev rule as the original project - see its README - so the camera is
@@ -110,17 +153,19 @@ http://192.168.50.2:8080/rgb.mjpg
 
 Useful flags (`python3 stream_server.py --help` for the full list):
 
-- `--rotate-degrees {0,90,180,270}` - orient the thermal image to match how
-  the P1 is mounted. `--rgb-rotate-degrees` does the same for the RGB
+- `--thermal-rotate-degrees {0,90,180,270}` - orient the thermal image to
+  match how the P1 is mounted. `--rgb-rotate-degrees` does the same for the RGB
   stream, independently (the two cameras can be mounted at different angles
   on the same bracket).
 - `--rgb-width`/`--rgb-height`/`--rgb-fps` - RGB capture resolution/rate
   (default 640x480 @ 15fps; the Camera Module 2 supports much higher, but
   start modest until we know what the direct Ethernet link and the Pi 4's
   CPU can comfortably sustain alongside the thermal stream).
-- `--thermal-fps` - cap the thermal publish rate (default: publish every
-  frame at the camera's native ~25-27fps; the P1's frames are tiny, so this
-  is cheap).
+- `--thermal-fps` - cap the thermal publish rate. Default: 12.5, an exact
+  half of the P1's assumed 25fps native rate (0 publishes every native
+  frame instead). `--detect-fps` defaults to match this - see "Real-time
+  detection" below for what happens with a value that doesn't divide the
+  native rate evenly.
 - `--no-rgb` / `--no-thermal` - run with only one camera, e.g. to test each
   independently before running both together.
 - `--no-timestamp` - each stream has a burned-in timestamp by default, handy
@@ -163,8 +208,15 @@ Console output includes a stats line every 60s:
 - **captured fps** - the P1's actual delivered frame rate (should sit near
   its native ~25-27fps; a sustained drop means something downstream, e.g.
   USB errors, is falling behind).
-- **detected fps** - should track `--detect-fps` (default 10) closely; if
-  it's meaningfully lower, detection itself is the bottleneck.
+- **detected fps** - should track `--detect-fps` closely; if it's
+  meaningfully lower, detection itself is the bottleneck. `--detect-fps`
+  defaults to whatever `--thermal-fps` is (12.5 by default for both - an
+  exact half of the P1's assumed 25fps native rate, so it's delivered
+  exactly). A target that isn't an exact sub-multiple of the native rate
+  gets silently rounded down to the nearest one actually achievable (e.g.
+  10 becomes a steady 8.33fps, not 10.0) - both scripts print a `[warning]`
+  at startup when this would happen, rather than leaving it to be
+  discovered here.
 - **ms/detect avg** - mean wall-clock time per detector call. WildMice's own
   benchmark measured 0.24ms/frame on their server hardware (~420x headroom
   at 10fps) and estimated 30-80x headroom on a Pi 4 - this stats line is how
@@ -186,11 +238,12 @@ confidence tiering, which the live pipeline never calls). `--no-detect` runs
 the streaming-only baseline, useful for isolating how much CPU headroom
 detection itself actually costs.
 
-**Note:** `--bg-alpha`/`--noise-alpha` are per-frame EMA weights tuned
-assuming `--detect-fps 10` (their default time constants, ~5s/10s, are
-stated in `detect_stream.py`'s `StreamConfig` docstring at that rate) -
-changing `--detect-fps` without adjusting them shifts how fast the
-background adapts.
+**Note:** `--bg-alpha`/`--noise-alpha` are per-frame EMA weights originally
+tuned by WildMice assuming a 10fps detect rate (their stated time constants,
+~5s/10s, are at that rate - see `detect_stream.py`'s `StreamConfig`
+docstring); at the current 12.5fps default they run slightly faster than
+that (proportionally), which is unlikely to matter in practice but is worth
+knowing if tuning these further.
 
 ## Field deployment: `field_recorder.py`
 
@@ -199,7 +252,7 @@ dependency at all, meant to run unattended for days as a systemd service.
 
 ```bash
 python3 field_recorder.py \
-    --rotate-degrees 180 \
+    --thermal-rotate-degrees 180 \
     --thermal-outdir recordings_thermal \
     --rgb-outdir recordings_rgb_events \
     --detections-log detections_events.jsonl
@@ -295,8 +348,9 @@ sudo systemctl daemon-reload
 ```
 
 **Before a real deployment**, check `field-recorder.service`'s
-`--rotate-degrees 180`: that value carried over from the single-camera
-rig's known mounting, and may not hold for the new dual-camera bracket.
+`--thermal-rotate-degrees 180`: that value carried over from the
+single-camera rig's known mounting, and may not hold for the new
+dual-camera bracket.
 
 ## Project layout
 
@@ -362,7 +416,7 @@ For `field_recorder.py`:
 - Write the triggering track id(s) into each RGB clip's `.json` sidecar,
   instead of relying on cross-referencing timestamps against
   `detections_events.jsonl`, if reviewing footage later turns out to need it.
-- Confirm `--rotate-degrees` (thermal) and `--rgb-rotate-degrees` (RGB,
+- Confirm `--thermal-rotate-degrees` and `--rgb-rotate-degrees` (RGB,
   independent of the thermal one since the two cameras can be mounted at
   different angles) against the actual dual-camera bracket once it's built,
   rather than assuming the old single-camera rig's value.

@@ -22,7 +22,7 @@ What it does:
 
 Example:
 
-    python3 field_recorder.py --model p1 --rotate-degrees 180 \\
+    python3 field_recorder.py --model p1 --thermal-rotate-degrees 180 \\
         --thermal-outdir recordings_thermal --rgb-outdir recordings_rgb_events
 
 Arguments:
@@ -31,7 +31,7 @@ Arguments:
   -------
   --model {p1,p3}
       Thermal camera model. Default: p1.
-  --rotate-degrees {0,90,180,270}
+  --thermal-rotate-degrees {0,90,180,270}
       Clockwise rotation applied to the thermal video and the detector.
       Default: 0.
   --duration N
@@ -52,9 +52,12 @@ Arguments:
   --thermal-fps N
       Thermal video frame rate; frames from the camera (native ~25-27fps
       for the P1, regardless of this) are thinned down to this rate. A
-      target that isn't an exact sub-multiple of the native rate is rounded
-      down to the nearest one actually achievable (e.g. 10 becomes a steady
-      8.33fps from a 25fps source). Default: 10.
+      target that isn't an exact sub-multiple of the native rate gets
+      rounded down to the nearest one actually achievable (e.g. 10 becomes
+      a steady 8.33fps from a 25fps source); a warning is printed at
+      startup when this would happen. 12.5 (the default) is an exact half
+      of the assumed 25fps native rate, so it's delivered exactly with no
+      rounding. Default: 12.5.
   --segment-seconds N
       Length of each thermal segment file, so a crash/power-loss only costs
       the in-progress segment. Default: 3600 (1 hour).
@@ -108,8 +111,8 @@ Arguments:
       on the Pi to see the exact modes/ranges available. Default: 15.
   --rgb-rotate-degrees {0,90,180,270}
       Clockwise rotation applied to the RGB clips - independent of
-      --rotate-degrees, since the two cameras can be mounted at different
-      angles on the same bracket. Default: 0.
+      --thermal-rotate-degrees, since the two cameras can be mounted at
+      different angles on the same bracket. Default: 0.
   --pre-roll-seconds N
       Seconds of RGB footage kept from before the trigger fires.
       Default: 2.
@@ -130,7 +133,9 @@ Arguments:
   --detect-fps N
       Rate the thermal stream (native ~25-27fps) is thinned down to before
       being fed to the detector - see the --thermal-fps note above about
-      rounding. Default: 10.
+      rounding (the same warning applies here). Defaults to whatever
+      --thermal-fps ends up being, so the saved video and the detector see
+      the same frames unless set independently.
   --detections-log PATH
       JSON-lines file finished detection events are appended to. Default:
       detections_events.jsonl.
@@ -214,6 +219,7 @@ Arguments:
 """
 
 import argparse
+import math
 import signal
 import threading
 
@@ -228,6 +234,38 @@ from p3_camera import Model
 # rather than imported, so this field-deployment entry point has no dependency on the
 # bench-testing one).
 LIVE_TRACK_FIELDS = ["merge_gap", "max_dist_frac", "iou_weight", "max_age", "process_var", "measure_var"]
+
+# The P1's documented native rate ("~25-27fps") - used only to warn when a requested
+# --thermal-fps/--detect-fps will actually be rounded down to something else. This is
+# a nominal assumption, not a measurement of the connected camera (see thermal_field_
+# recorder.py's own stats line for the real, measured captured fps of a given unit).
+NOMINAL_NATIVE_FPS = 25.0
+
+
+def _warn_if_fps_needs_rounding(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
+    """--thermal-fps/--detect-fps both work by waiting until due on every native-rate
+    capture tick (see thermal_field_recorder.py) - a target that isn't an exact whole
+    sub-multiple of the native rate gets silently rounded down to the nearest one that
+    is, not delivered exactly (e.g. 10 against a 25fps native rate becomes a steady
+    8.33fps, not 10.0 - every 3rd captured frame, since 100ms isn't a whole multiple of
+    the ~40ms native tick). Warn about that up front instead of leaving it to be
+    discovered in the stats line.
+    """
+    if not (0 < target_fps < native_fps):
+        return  # 0 (unthrottled) or >= native rate: nothing to round
+    ticks = native_fps / target_fps
+    rounded_ticks = math.ceil(ticks - 1e-9)
+    if abs(ticks - rounded_ticks) > 1e-6:
+        achieved = native_fps / rounded_ticks
+        exact_examples = ", ".join(
+            f"{native_fps / n:g}" for n in (1, 2, 3, 4, 5) if native_fps / n < native_fps
+        )
+        print(
+            f"[warning] {flag} {target_fps:g} is not an exact sub-multiple of the P1's "
+            f"assumed ~{native_fps:g}fps native rate: it will actually run at a steady "
+            f"~{achieved:.2f}fps (every {rounded_ticks} captured frames), not "
+            f"{target_fps:g}. Exact sub-multiples ({exact_examples}, ...) avoid this."
+        )
 
 
 def _add_config_args(group, cfg_instance, fields=None):
@@ -250,7 +288,7 @@ def parse_args():
         help="Thermal camera model. Default: p1.",
     )
     parser.add_argument(
-        "--rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
+        "--thermal-rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
         help="Clockwise rotation applied to the thermal video and the detector. Default: 0.",
     )
     parser.add_argument(
@@ -264,9 +302,11 @@ def parse_args():
     thermal_group.add_argument("--thermal-prefix", default="thermal")
     thermal_group.add_argument("--thermal-format", choices=["avi", "avi-mjpg", "mp4"], default="avi")
     thermal_group.add_argument(
-        "--thermal-fps", type=float, default=10.0,
+        "--thermal-fps", type=float, default=12.5,
         help="Thermal video frame rate; frames from the camera (native ~25-27fps for the P1, "
-        "regardless of this) are thinned down to this rate. Default: 10.",
+        "regardless of this) are thinned down to this rate. 12.5 is an exact half of the "
+        "P1's nominal 25fps, so it's delivered exactly rather than rounded - see "
+        "--detect-fps. Default: 12.5.",
     )
     thermal_group.add_argument(
         "--segment-seconds", type=float, default=3600.0,
@@ -316,8 +356,8 @@ def parse_args():
     rgb_group.add_argument(
         "--rgb-rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
         help="Clockwise rotation applied to the RGB clips - independent of "
-        "--rotate-degrees, since the two cameras can be mounted at different angles "
-        "on the same bracket. Default: 0.",
+        "--thermal-rotate-degrees, since the two cameras can be mounted at different "
+        "angles on the same bracket. Default: 0.",
     )
     rgb_group.add_argument(
         "--pre-roll-seconds", type=float, default=2.0,
@@ -341,7 +381,11 @@ def parse_args():
         help="Disable the detector entirely. Also disables RGB event recording, since "
         "nothing would ever trigger it.",
     )
-    detect_group.add_argument("--detect-fps", type=float, default=10.0)
+    detect_group.add_argument(
+        "--detect-fps", type=float, default=None,
+        help="Rate the thermal stream is thinned down to before being fed to the "
+        "detector. Defaults to whatever --thermal-fps ends up being.",
+    )
     detect_group.add_argument("--detections-log", default="detections_events.jsonl")
 
     stream_group = parser.add_argument_group(
@@ -360,6 +404,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.detect_fps is None:
+        args.detect_fps = args.thermal_fps
+    _warn_if_fps_needs_rounding("--thermal-fps", args.thermal_fps)
+    _warn_if_fps_needs_rounding("--detect-fps", args.detect_fps)
+
     stream_cfg = StreamConfig(**{f: getattr(args, f) for f in vars(StreamConfig())})
     track_cfg = TrackConfig(**{f: getattr(args, f) for f in LIVE_TRACK_FIELDS})
 
@@ -380,7 +430,7 @@ def main():
             prefix=args.thermal_prefix,
             fmt=args.thermal_format,
             fps=args.thermal_fps,
-            rotate_degrees=args.rotate_degrees,
+            rotate_degrees=args.thermal_rotate_degrees,
             temp_min_c=args.temp_min_c,
             temp_max_c=args.temp_max_c,
             save_raw=args.save_raw,

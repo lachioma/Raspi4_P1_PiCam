@@ -21,7 +21,7 @@ and that project's README for how it works.
 
 Example:
 
-    python3 stream_server.py --model p1 --rotate-degrees 0 \\
+    python3 stream_server.py --model p1 --thermal-rotate-degrees 0 \\
         --rgb-width 640 --rgb-height 480 --rgb-fps 15 --port 8080
 
 Arguments:
@@ -30,12 +30,12 @@ Arguments:
   -------
   --model {p1,p3}
       Thermal camera model. Default: p1.
-  --rotate-degrees {0,90,180,270}
+  --thermal-rotate-degrees {0,90,180,270}
       Clockwise rotation applied to the thermal video/detector. Default: 0.
   --rgb-rotate-degrees {0,90,180,270}
       Clockwise rotation applied to the RGB stream - independent of
-      --rotate-degrees, since the two cameras can be mounted at different
-      angles on the same bracket. Default: 0.
+      --thermal-rotate-degrees, since the two cameras can be mounted at
+      different angles on the same bracket. Default: 0.
   --rgb-width N
       RGB capture width, in pixels. Default: 640.
   --rgb-height N
@@ -51,11 +51,13 @@ Arguments:
   ---------
   --thermal-fps N
       Cap the thermal stream's publish rate (0 = publish every frame at the
-      camera's native ~25-27fps). Like --detect-fps below, a target that
-      isn't an exact sub-multiple of the native rate is rounded down to the
-      nearest one the camera can actually deliver (e.g. 10 becomes a steady
-      8.33fps from a 25fps source - see thermal_source.py's publish-throttle
-      comment). Default: 0.
+      camera's native ~25-27fps). A target that isn't an exact sub-multiple
+      of the native rate gets rounded down to the nearest one the camera
+      can actually deliver (e.g. 10 becomes a steady 8.33fps from a 25fps
+      source - see thermal_source.py's publish-throttle comment); a warning
+      is printed at startup when this would happen. 12.5 (the default) is
+      an exact half of the assumed 25fps native rate, so it's delivered
+      exactly with no rounding. Default: 12.5.
   --jpeg-quality N
       JPEG encode quality (1-100) for both streams. Default: 85.
   --no-timestamp
@@ -80,7 +82,9 @@ Arguments:
   --detect-fps N
       Rate the thermal stream (native ~25-27fps) is thinned down to before
       being fed to the detector - see the --thermal-fps note above about
-      rounding. Default: 10.
+      rounding (the same warning applies here). Defaults to whatever
+      --thermal-fps ends up being, so the two see the same frames unless
+      set independently.
   --detections-log PATH
       JSON-lines file finished detection events are appended to. Default:
       detections_events.jsonl.
@@ -164,6 +168,7 @@ Arguments:
 """
 
 import argparse
+import math
 import signal
 import threading
 
@@ -183,6 +188,38 @@ from p3_camera import Model
 # not a classifier"). Exposing those as flags here would silently do nothing, so only the six
 # that actually affect live tracking are surfaced.
 LIVE_TRACK_FIELDS = ["merge_gap", "max_dist_frac", "iou_weight", "max_age", "process_var", "measure_var"]
+
+# The P1's documented native rate ("~25-27fps") - used only to warn when a requested
+# --thermal-fps/--detect-fps will actually be rounded down to something else. This is
+# a nominal assumption, not a measurement of the connected camera (see thermal_source.
+# py's own stats line for the real, measured captured fps of a given unit).
+NOMINAL_NATIVE_FPS = 25.0
+
+
+def _warn_if_fps_needs_rounding(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
+    """--thermal-fps/--detect-fps both work by waiting until due on every native-rate
+    capture tick (see thermal_source.py) - a target that isn't an exact whole
+    sub-multiple of the native rate gets silently rounded down to the nearest one that
+    is, not delivered exactly (e.g. 10 against a 25fps native rate becomes a steady
+    8.33fps, not 10.0 - every 3rd captured frame, since 100ms isn't a whole multiple of
+    the ~40ms native tick). Warn about that up front instead of leaving it to be
+    discovered in the stats line.
+    """
+    if not (0 < target_fps < native_fps):
+        return  # 0 (unthrottled) or >= native rate: nothing to round
+    ticks = native_fps / target_fps
+    rounded_ticks = math.ceil(ticks - 1e-9)
+    if abs(ticks - rounded_ticks) > 1e-6:
+        achieved = native_fps / rounded_ticks
+        exact_examples = ", ".join(
+            f"{native_fps / n:g}" for n in (1, 2, 3, 4, 5) if native_fps / n < native_fps
+        )
+        print(
+            f"[warning] {flag} {target_fps:g} is not an exact sub-multiple of the P1's "
+            f"assumed ~{native_fps:g}fps native rate: it will actually run at a steady "
+            f"~{achieved:.2f}fps (every {rounded_ticks} captured frames), not "
+            f"{target_fps:g}. Exact sub-multiples ({exact_examples}, ...) avoid this."
+        )
 
 
 def _add_config_args(group, cfg_instance, fields=None):
@@ -207,13 +244,15 @@ def parse_args():
         help="Thermal camera model. Default: p1.",
     )
     parser.add_argument(
-        "--rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
+        "--thermal-rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
         help="Clockwise rotation applied to the thermal stream. Default: 0.",
     )
     parser.add_argument(
-        "--thermal-fps", type=float, default=0.0,
+        "--thermal-fps", type=float, default=12.5,
         help="Cap the thermal stream's publish rate (0 = publish every frame "
-        "at the camera's native ~25-27fps). Default: 0.",
+        "at the camera's native ~25-27fps). 12.5 is an exact half of the P1's nominal "
+        "25fps, so it's delivered exactly rather than rounded - see --detect-fps. "
+        "Default: 12.5.",
     )
     parser.add_argument(
         "--rgb-width", type=int, default=640, help="RGB capture width. Default: 640.",
@@ -227,8 +266,8 @@ def parse_args():
     parser.add_argument(
         "--rgb-rotate-degrees", type=int, choices=[0, 90, 180, 270], default=0,
         help="Clockwise rotation applied to the RGB stream - independent of "
-        "--rotate-degrees, since the two cameras can be mounted at different angles "
-        "on the same bracket. Default: 0.",
+        "--thermal-rotate-degrees, since the two cameras can be mounted at different "
+        "angles on the same bracket. Default: 0.",
     )
     parser.add_argument(
         "--jpeg-quality", type=int, default=85,
@@ -259,9 +298,10 @@ def parse_args():
         "baseline CPU load before comparing it against detection enabled.",
     )
     parser.add_argument(
-        "--detect-fps", type=float, default=10.0,
+        "--detect-fps", type=float, default=None,
         help="Rate the thermal stream (native ~25-27fps) is thinned down to before being fed "
-        "to the detector. Default: 10.",
+        "to the detector. Defaults to whatever --thermal-fps ends up being, so the "
+        "stream and the detector see the same frames unless set explicitly.",
     )
     parser.add_argument(
         "--detections-log", default="detections_events.jsonl",
@@ -288,6 +328,11 @@ def main():
     if args.no_rgb and args.no_thermal:
         raise SystemExit("--no-rgb and --no-thermal can't both be set - nothing to stream.")
 
+    if args.detect_fps is None:
+        args.detect_fps = args.thermal_fps
+    _warn_if_fps_needs_rounding("--thermal-fps", args.thermal_fps)
+    _warn_if_fps_needs_rounding("--detect-fps", args.detect_fps)
+
     stream_cfg = StreamConfig(**{f: getattr(args, f) for f in vars(StreamConfig())})
     track_cfg = TrackConfig(**{f: getattr(args, f) for f in LIVE_TRACK_FIELDS})
 
@@ -306,7 +351,7 @@ def main():
                 bus=thermal_bus,
                 stop_event=stop_event,
                 model=args.model,
-                rotate_degrees=args.rotate_degrees,
+                rotate_degrees=args.thermal_rotate_degrees,
                 fps_limit=args.thermal_fps,
                 jpeg_quality=args.jpeg_quality,
                 show_timestamp=not args.no_timestamp,
