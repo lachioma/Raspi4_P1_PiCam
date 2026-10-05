@@ -30,10 +30,14 @@ import numpy as np
 
 from p3_camera import celsius_to_raw
 
-FOURCC_BY_FORMAT = {
-    "avi": "XVID",
-    "avi-mjpg": "MJPG",
-    "mp4": "mp4v",
+# --thermal-format value -> (file extension, fourcc). The extension must be a real
+# container name, not the format string itself: OpenCV picks the container from the
+# filename, and "x.avi-mjpg" isn't one, so VideoWriter silently fails to open. (The
+# original record_p1_segmented.py has the same latent bug for its avi-mjpg option.)
+FORMATS = {
+    "avi": ("avi", "XVID"),
+    "avi-mjpg": ("avi", "MJPG"),
+    "mp4": ("mp4", "mp4v"),
 }
 
 # cv2.rotate() codes, keyed by clockwise rotation in degrees.
@@ -148,12 +152,13 @@ class SegmentWriter:
     def open(self):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"{self.prefix}_{stamp}"
-        self.video_path = self.outdir / f"{base}.{self.fmt}"
+        extension, fourcc_code = FORMATS[self.fmt]
+        self.video_path = self.outdir / f"{base}.{extension}"
         self.raw_path = self.outdir / f"{base}_raw.dat"
         self.ts_path = self.outdir / f"{base}_timestamps.txt"
         self.meta_path = self.outdir / f"{base}.json"
 
-        fourcc = cv2.VideoWriter_fourcc(*FOURCC_BY_FORMAT[self.fmt])
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_code)
         # Written as color (grayscale replicated across BGR channels, plus any
         # detection overlay) since single-channel output is unreliable across
         # OpenCV/ffmpeg backends for MP4; this keeps the file directly

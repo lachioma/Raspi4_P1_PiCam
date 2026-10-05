@@ -22,6 +22,8 @@ from frame_bus import FrameBus
 from live_detection import EventLogger, LiveDetector, StreamConfig, TrackConfig
 from overlay import draw_timestamp
 from p3_camera import FrameMarkerMismatchError, Model, P3Camera, get_model_config
+from rate_limiter import RateLimiter
+from stats_logger import StatsLogger
 
 ROTATE_CODES = {
     0: None,
@@ -85,6 +87,8 @@ def run(
     stream_cfg: StreamConfig | None = None,
     track_cfg: TrackConfig | None = None,
     detections_log_path: str | None = "detections_events.jsonl",
+    stats_log_path: str | None = None,
+    stationary_timeout_s: float = 20.0,
 ):
     """Runs until stop_event is set. Intended to be the target of a daemon thread."""
     camera = _connect(model, connect_retry_interval, max_reconnect_seconds, stop_event)
@@ -94,24 +98,25 @@ def run(
 
     detector = None
     logger = None
-    detect_interval = 0.0
-    next_detect_due = time.time()
+    detect_gate = RateLimiter(detect_fps)
     overlay_boxes = []
     overlay_timestamp = 0.0
     if enable_detection:
         raw_h, raw_w = camera.config.sensor_h, camera.config.sensor_w
         det_w, det_h = (raw_h, raw_w) if rotate_degrees in (90, 270) else (raw_w, raw_h)
         detector = LiveDetector(det_w, det_h, stream_cfg or StreamConfig(),
-                                 track_cfg or TrackConfig(), fps=detect_fps)
-        detect_interval = 1.0 / detect_fps if detect_fps > 0 else 0.0
+                                 track_cfg or TrackConfig(), fps=detect_fps,
+                                 stationary_timeout_s=stationary_timeout_s)
         if detections_log_path:
             logger = EventLogger(detections_log_path)
         print(f"[thermal] detection enabled: {det_w}x{det_h} @ up to {detect_fps}fps "
               f"-> {detections_log_path or '(not logged)'}")
 
+    stats_logger = StatsLogger(stats_log_path) if stats_log_path else None
+    log_write_failed = False  # rate-limits the "can't write detections" warning to once
+
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
-    frame_interval = 1.0 / fps_limit if fps_limit > 0 else 0.0
-    next_frame_due = time.time()
+    publish_gate = RateLimiter(fps_limit)
     consecutive_errors = 0
 
     captured_count = 0
@@ -153,8 +158,7 @@ def run(
             code = ROTATE_CODES[rotate_degrees]
             frame = ir_brightness if code is None else cv2.rotate(ir_brightness, code)
 
-            if detector is not None and now >= next_detect_due:
-                next_detect_due = max(now, next_detect_due) + detect_interval
+            if detector is not None and detect_gate.ready(now):
                 t0 = time.perf_counter()
                 overlay_boxes, events = detector.process(frame)
                 detect_time_total += time.perf_counter() - t0
@@ -162,7 +166,16 @@ def run(
                 overlay_timestamp = now
                 if logger is not None:
                     for ev in events:
-                        logger.log(ev, now)
+                        try:
+                            logger.log(ev, now)
+                        except OSError as e:
+                            if not log_write_failed:
+                                print(f"[thermal] could not write to detections log "
+                                      f"({e!r}); further failures won't be reported "
+                                      "again until this one clears.")
+                                log_write_failed = True
+                        else:
+                            log_write_failed = False
 
             if now - overlay_timestamp > _OVERLAY_MAX_AGE_SECONDS:
                 overlay_boxes = []
@@ -170,19 +183,29 @@ def run(
             if now - last_stats_time >= STATS_INTERVAL_SECONDS:
                 elapsed = now - last_stats_time
                 avg_detect_ms = (detect_time_total / detected_count * 1000) if detected_count else 0.0
+                captured_fps = captured_count / elapsed
+                detected_fps = detected_count / elapsed
                 print(
-                    f"[thermal] stats: {captured_count / elapsed:.1f} captured fps, "
-                    f"{detected_count / elapsed:.1f} detected fps, "
+                    f"[thermal] stats: {captured_fps:.1f} captured fps, "
+                    f"{detected_fps:.1f} detected fps, "
                     f"{avg_detect_ms:.1f} ms/detect avg"
                 )
+                if stats_logger is not None:
+                    try:
+                        stats_logger.log(
+                            captured_fps=round(captured_fps, 2),
+                            detected_fps=round(detected_fps, 2),
+                            avg_detect_ms=round(avg_detect_ms, 2),
+                        )
+                    except OSError:
+                        pass
                 captured_count = 0
                 detected_count = 0
                 detect_time_total = 0.0
                 last_stats_time = now
 
-            if frame_interval > 0 and now < next_frame_due:
+            if not publish_gate.ready(now):
                 continue
-            next_frame_due = max(now, next_frame_due) + frame_interval if frame_interval > 0 else now
 
             bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             if overlay_boxes:
@@ -196,9 +219,20 @@ def run(
     finally:
         if detector is not None and logger is not None:
             for ev in detector.flush():
-                logger.log(ev, time.time())
+                try:
+                    logger.log(ev, time.time())
+                except OSError as e:
+                    print(f"[thermal] could not write final detections on shutdown ({e!r}).")
         if logger is not None:
-            logger.close()
+            try:
+                logger.close()
+            except OSError:
+                pass
+        if stats_logger is not None:
+            try:
+                stats_logger.close()
+            except OSError:
+                pass
         try:
             camera.stop_streaming()
             camera.disconnect()

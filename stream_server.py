@@ -51,13 +51,13 @@ Arguments:
   ---------
   --thermal-fps N
       Cap the thermal stream's publish rate (0 = publish every frame at the
-      camera's native ~25-27fps). A target that isn't an exact sub-multiple
-      of the native rate gets rounded down to the nearest one the camera
-      can actually deliver (e.g. 10 becomes a steady 8.33fps from a 25fps
-      source - see thermal_source.py's publish-throttle comment); a warning
-      is printed at startup when this would happen. 12.5 (the default) is
-      an exact half of the assumed 25fps native rate, so it's delivered
-      exactly with no rounding. Default: 12.5.
+      camera's native ~25-27fps). The average is exact for any target up
+      to the native rate (see rate_limiter.py), but a frame can only be
+      taken on a camera tick: a target that isn't a whole divisor of 25
+      (e.g. 10) gives uneven spacing - frames alternately 2 and 3 ticks
+      (80/120ms) apart - and a [note] is printed at startup when that
+      applies. 12.5 (the default) is exactly every 2nd frame, evenly
+      spaced. Default: 12.5.
   --jpeg-quality N
       JPEG encode quality (1-100) for both streams. Default: 85.
   --no-timestamp
@@ -82,12 +82,31 @@ Arguments:
   --detect-fps N
       Rate the thermal stream (native ~25-27fps) is thinned down to before
       being fed to the detector - see the --thermal-fps note above about
-      rounding (the same warning applies here). Defaults to whatever
-      --thermal-fps ends up being, so the two see the same frames unless
-      set independently.
+      spacing (the same applies here). Defaults to whatever --thermal-fps
+      ends up being, so the two see the same frames unless set
+      independently.
+  --stationary-timeout-seconds N
+      A tracked object that hasn't moved (centroid within ~8% of the frame
+      diagonal) for this long is ended and folded into the background, so
+      it stops re-triggering. Without it, a *static* thing that gets
+      detected once (a fixture warming in the sun) is detected forever,
+      because the detector deliberately keeps detected pixels out of its
+      background so a resting animal doesn't vanish - overnight tests saw
+      single tracks last 16-52 hours. An animal that genuinely sits still
+      this long is absorbed too, and detected again as soon as it moves.
+      0 disables. Default: 20.
   --detections-log PATH
       JSON-lines file finished detection events are appended to. Default:
       detections_events.jsonl.
+  --no-stats-log
+      Disable the periodic stats JSON-lines logs below. On by default -
+      one short line per camera per minute, negligible cost.
+  --thermal-stats-log PATH
+      JSON-lines log of the thermal/detection stats line that's also
+      printed every 60s (captured fps, detected fps, mean detect time).
+      Default: thermal_stats.jsonl.
+  --rgb-stats-log PATH
+      Same idea for the RGB side (captured fps). Default: rgb_stats.jsonl.
 
   Detection tuning (detect_stream.py's StreamConfig - see live_detection.py
   and WildMice/thermal_detect/README.md's "Real-time detection on the
@@ -189,36 +208,31 @@ from p3_camera import Model
 # that actually affect live tracking are surfaced.
 LIVE_TRACK_FIELDS = ["merge_gap", "max_dist_frac", "iou_weight", "max_age", "process_var", "measure_var"]
 
-# The P1's documented native rate ("~25-27fps") - used only to warn when a requested
-# --thermal-fps/--detect-fps will actually be rounded down to something else. This is
-# a nominal assumption, not a measurement of the connected camera (see thermal_source.
-# py's own stats line for the real, measured captured fps of a given unit).
+# The P1's documented native rate ("~25-27fps") - used only to flag when a requested
+# --thermal-fps/--detect-fps won't give evenly spaced frames. A nominal assumption,
+# not a measurement of the connected camera (see the stats line for the real one).
 NOMINAL_NATIVE_FPS = 25.0
 
 
-def _warn_if_fps_needs_rounding(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
-    """--thermal-fps/--detect-fps both work by waiting until due on every native-rate
-    capture tick (see thermal_source.py) - a target that isn't an exact whole
-    sub-multiple of the native rate gets silently rounded down to the nearest one that
-    is, not delivered exactly (e.g. 10 against a 25fps native rate becomes a steady
-    8.33fps, not 10.0 - every 3rd captured frame, since 100ms isn't a whole multiple of
-    the ~40ms native tick). Warn about that up front instead of leaving it to be
-    discovered in the stats line.
+def _note_if_fps_uneven(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
+    """The average rate of --thermal-fps/--detect-fps is exact for any target up to the
+    camera's rate (rate_limiter.py keeps a fixed schedule), but a frame can only be
+    taken on a capture tick: if the target isn't a whole divisor of the native rate
+    (e.g. 10 from 25fps) the spacing alternates between two tick multiples (80 and
+    120ms) instead of being constant. Worth knowing for the saved video's timing,
+    so say so up front.
     """
     if not (0 < target_fps < native_fps):
-        return  # 0 (unthrottled) or >= native rate: nothing to round
+        return  # 0 (unthrottled) or >= native rate: nothing to thin
     ticks = native_fps / target_fps
-    rounded_ticks = math.ceil(ticks - 1e-9)
-    if abs(ticks - rounded_ticks) > 1e-6:
-        achieved = native_fps / rounded_ticks
-        exact_examples = ", ".join(
-            f"{native_fps / n:g}" for n in (1, 2, 3, 4, 5) if native_fps / n < native_fps
-        )
+    if abs(ticks - round(ticks)) > 1e-6:
+        lo, hi = math.floor(ticks), math.ceil(ticks)
         print(
-            f"[warning] {flag} {target_fps:g} is not an exact sub-multiple of the P1's "
-            f"assumed ~{native_fps:g}fps native rate: it will actually run at a steady "
-            f"~{achieved:.2f}fps (every {rounded_ticks} captured frames), not "
-            f"{target_fps:g}. Exact sub-multiples ({exact_examples}, ...) avoid this."
+            f"[note] {flag} {target_fps:g} isn't a whole divisor of the P1's assumed "
+            f"~{native_fps:g}fps: the average will be {target_fps:g}fps, but frames will be "
+            f"spaced unevenly ({lo} or {hi} camera frames apart, ~{lo * 1000 / native_fps:.0f} "
+            f"or ~{hi * 1000 / native_fps:.0f}ms). Whole divisors ({native_fps / 2:g}, "
+            f"{native_fps / 3:.2f}, {native_fps / 4:g}, {native_fps / 5:g}, ...) are evenly spaced."
         )
 
 
@@ -250,8 +264,8 @@ def parse_args():
     parser.add_argument(
         "--thermal-fps", type=float, default=12.5,
         help="Cap the thermal stream's publish rate (0 = publish every frame "
-        "at the camera's native ~25-27fps). 12.5 is an exact half of the P1's nominal "
-        "25fps, so it's delivered exactly rather than rounded - see --detect-fps. "
+        "at the camera's native ~25-27fps). The average is exact for any target; 12.5 is "
+        "exactly every 2nd frame of the P1's nominal 25fps, so it's also evenly spaced. "
         "Default: 12.5.",
     )
     parser.add_argument(
@@ -304,9 +318,30 @@ def parse_args():
         "stream and the detector see the same frames unless set explicitly.",
     )
     parser.add_argument(
+        "--stationary-timeout-seconds", type=float, default=20.0,
+        help="End a tracked object that hasn't moved for this long and fold it into the "
+        "background so it stops re-triggering (0 disables). Default: 20.",
+    )
+    parser.add_argument(
         "--detections-log", default="detections_events.jsonl",
         help="JSON-lines file finished detection events are appended to. "
         "Default: detections_events.jsonl.",
+    )
+    parser.add_argument(
+        "--no-stats-log", action="store_true",
+        help="Disable the periodic captured/detected-fps and detect-time JSON-lines logs "
+        "(one per camera - see --thermal-stats-log/--rgb-stats-log). On by default and "
+        "cheap (one line per minute); this is for when even that's unwanted.",
+    )
+    parser.add_argument(
+        "--thermal-stats-log", default="thermal_stats.jsonl",
+        help="JSON-lines file the thermal/detection stats line (also printed every 60s) is "
+        "appended to. Default: thermal_stats.jsonl.",
+    )
+    parser.add_argument(
+        "--rgb-stats-log", default="rgb_stats.jsonl",
+        help="JSON-lines file the RGB capture stats line is appended to. "
+        "Default: rgb_stats.jsonl.",
     )
     stream_group = parser.add_argument_group(
         "detection tuning (detect_stream.py)",
@@ -330,8 +365,12 @@ def main():
 
     if args.detect_fps is None:
         args.detect_fps = args.thermal_fps
-    _warn_if_fps_needs_rounding("--thermal-fps", args.thermal_fps)
-    _warn_if_fps_needs_rounding("--detect-fps", args.detect_fps)
+    _note_if_fps_uneven("--thermal-fps", args.thermal_fps)
+    _note_if_fps_uneven("--detect-fps", args.detect_fps)
+
+    if args.no_stats_log:
+        args.thermal_stats_log = None
+        args.rgb_stats_log = None
 
     stream_cfg = StreamConfig(**{f: getattr(args, f) for f in vars(StreamConfig())})
     track_cfg = TrackConfig(**{f: getattr(args, f) for f in LIVE_TRACK_FIELDS})
@@ -360,6 +399,8 @@ def main():
                 stream_cfg=stream_cfg,
                 track_cfg=track_cfg,
                 detections_log_path=args.detections_log,
+                stats_log_path=args.thermal_stats_log,
+                stationary_timeout_s=args.stationary_timeout_seconds,
             ),
             daemon=True,
             name="thermal-capture",
@@ -379,6 +420,7 @@ def main():
                 rotate_degrees=args.rgb_rotate_degrees,
                 jpeg_quality=args.jpeg_quality,
                 show_timestamp=not args.no_timestamp,
+                stats_log_path=args.rgb_stats_log,
             ),
             daemon=True,
             name="rgb-capture",

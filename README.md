@@ -210,13 +210,16 @@ Console output includes a stats line every 60s:
   USB errors, is falling behind).
 - **detected fps** - should track `--detect-fps` closely; if it's
   meaningfully lower, detection itself is the bottleneck. `--detect-fps`
-  defaults to whatever `--thermal-fps` is (12.5 by default for both - an
-  exact half of the P1's assumed 25fps native rate, so it's delivered
-  exactly). A target that isn't an exact sub-multiple of the native rate
-  gets silently rounded down to the nearest one actually achievable (e.g.
-  10 becomes a steady 8.33fps, not 10.0) - both scripts print a `[warning]`
-  at startup when this would happen, rather than leaving it to be
-  discovered here.
+  defaults to whatever `--thermal-fps` is (12.5 by default for both - exactly
+  every 2nd frame of the P1's ~25fps). The average is exact for any target up
+  to the camera's rate; one that isn't a whole divisor of 25 (e.g. 10) just
+  has uneven spacing - frames alternately 80 and 120ms apart - and both
+  scripts print a `[note]` at startup when that applies. (An earlier version
+  of the detect/publish gates restarted their clock from each frame's actual
+  arrival instead of keeping a fixed schedule, which made `--detect-fps 12.5`
+  run at 10.0 - and `10` at 8.3 - while recording ran at the right rate in the
+  same process; `rate_limiter.py` now does all of them. Overnight runs are
+  how this showed up: recording at 12.49fps, detection at 10.0.)
 - **ms/detect avg** - mean wall-clock time per detector call. WildMice's own
   benchmark measured 0.24ms/frame on their server hardware (~420x headroom
   at 10fps) and estimated 30-80x headroom on a Pi 4 - this stats line is how
@@ -254,9 +257,12 @@ dependency at all, meant to run unattended for days as a systemd service.
 python3 field_recorder.py \
     --thermal-rotate-degrees 180 \
     --thermal-outdir recordings_thermal \
-    --rgb-outdir recordings_rgb_events \
-    --detections-log detections_events.jsonl
+    --rgb-outdir recordings_rgb_events
 ```
+
+(`--detections-log` and the stats logs below default to living inside
+`--thermal-outdir`/`--rgb-outdir` - no need to name them explicitly unless
+you want them somewhere else.)
 
 ### How the RGB trigger works
 
@@ -332,6 +338,121 @@ deployment's SD card is small relative to expected activity, lower
 before shortening `--segment-seconds` or touching the thermal-side
 settings, which are the deployment's core, always-on record.
 
+Both free-space checks run continuously (every ~60s, alongside the stats
+line below), not only when opening a new segment/clip - an early version
+only checked at those boundaries, so a card that filled up in the middle of
+an hour-long thermal segment (or a long RGB clip kept open by back-to-back
+triggers) wasn't caught until the next one opened, by which point the
+camera's own video writer (OpenCV/FFmpeg) was already silently failing
+("Failed to write frame") and - worse - a single disk-full write to
+`detections_events.jsonl` or a segment's `.json`/`.csv` sidecar (plain
+Python file writes, unlike the video writer, raise on `ENOSPC` rather than
+warning and continuing) could crash that capture thread outright with
+nothing but a traceback on a console nobody was watching. Both of those
+write paths are now caught and logged instead of left to crash, and the
+periodic check stops recording proactively well before actually hitting
+zero bytes.
+
+### Stats logging
+
+On by default (`--no-stats-log` to disable): every ~60s, each subsystem
+writes one JSON-lines record of what it's been doing - `--thermal-stats-log`
+(captured fps, detected fps, mean detection time, free disk space on
+`--thermal-outdir` - default `stats.jsonl` there) and `--rgb-stats-log`
+(captured fps, mean capture time, mean video-encode time, whether a clip is
+currently open, free disk space on `--rgb-outdir` - default `stats.jsonl`
+there). This is the same information already printed to the console every
+minute, just persisted - the point being exactly the scenario above: a
+multi-day unattended run where nobody is watching the console live, and the
+only way to reconstruct what happened (did fps hold up, when did the disk
+start filling, was a clip open at the time, was capture or encoding the
+bottleneck) is to check back afterwards. The cost is negligible (one short
+line a minute per subsystem), which is why this didn't need a separate
+toggleable "test mode" - it's cheap enough to simply leave on.
+
+The capture/encode split in particular is a deliberate diagnostic: a
+capture loop's overall wall-clock time naturally includes time spent
+*waiting* for the next frame at the configured rate, which isn't itself a
+problem - but the encode timing (`cv2.VideoWriter.write()` for RGB event
+clips, `cv2.imencode()` for the MJPEG preview) is pure CPU work with no
+legitimate wait in it, so `avg_encode_ms` approaching or exceeding the
+per-frame budget (`1000 / fps` ms) is a direct sign that software video
+encoding - not the camera/ISP hardware - is the bottleneck.
+
+That diagnostic was added investigating why a `--rgb-width 1640
+--rgb-height 1232 --rgb-fps 30` run only achieved ~17-19fps in its saved
+clips, despite that sensor mode supporting up to 81fps per `sensor_modes`
+(see "Setup on the Raspberry Pi"). A 21-hour test settled it: with no clip
+open the RGB loop holds 29.98fps (`avg_capture_ms` ~33.3, i.e. just waiting
+for the next frame, correctly); with an XVID clip open `avg_encode_ms` is
+**48-69ms per frame against a 33ms budget**, and `avg_capture_ms` drops to
+~7ms (frames are queued waiting for the encoder). 1000 / (7.3 + 48.3) =
+18fps - exactly what was measured. So XVID at 1640x1232 tops out around
+18-20fps on this Pi, whatever `--rgb-fps` says, and the thermal thread's
+detection time stayed at 3.3-4.1ms alongside it (vs 2.6ms with no RGB
+activity), so contention between the two is real but minor next to the
+encoder's own cost. The encode time also stepped up from ~49 to ~69ms
+(18 -> 13fps) about five hours into the clip, as the file's growth rate
+tripled from ~2.3 to ~7GB/hour: the scene getting dark - a noisier image is
+both slower to encode and much bigger. Budget RGB disk at *night* rates.
+
+`--rgb-format avi-mjpg` (motion-JPEG) is the cheaper-to-encode alternative,
+but note it silently failed until recently: the saved file got the extension
+`.avi-mjpg`, which OpenCV can't map to a container, so `VideoWriter` never
+opened and (with an exception nothing caught) the RGB thread died on the
+first event - a 3-day run produced no RGB clips at all. Fixed: it now writes
+a normal `.avi`, a failed open is logged and retried instead of killing the
+thread, and `field_recorder.py` exits (so systemd can restart it) if either
+worker thread ends unexpectedly. A hardware-encoded path via picamera2's own
+H.264 encoder would be the most efficient fix but is a larger architectural
+change, not yet implemented.
+
+### Heat and power indicators
+
+For runs of days or weeks, both field stats logs (`health_monitor.py`) also
+record, every minute: `cpu_temp_c` (the Pi 4 starts throttling at 80C; the
+"GPU" temperature `vcgencmd` shows is this same sensor), any further hwmon
+temperature sensors the kernel exposes (`other_temps_c` - an SSD, PoE HAT),
+fan speeds (`fans_rpm`), the CPU clock against its ceiling (`cpu_freq_mhz` /
+`cpu_freq_max_mhz` - a clock below max under load is throttling caught in the
+act), the firmware throttle flags decoded both for *now* (`throttled_now`)
+and *since boot* (`throttled_since_boot`, which latches so a one-sample
+glitch isn't missed) - `under_voltage` (a sagging supply, often mistaken for
+heat), `freq_capped`, `throttled`, `soft_temp_limit` - plus the raw
+`throttled` hex (`0x0` = clean), the 1-minute `load_1m`, and
+`proc_cpu_pct` (this process's CPU, all threads; 100 = one core). The thermal
+log adds `scene_mean_c` / `scene_max_c` from the camera's latest raw frame
+(relative, not calibrated - a hot enclosure or fixture in view shows up
+there), `active_tracks`, camera `frame_errors` and `reconnects`. A
+`[warning]` line is also printed once per episode when a throttle/
+under-voltage flag goes active or the SoC reaches 80C, so a console watcher
+sees it start.
+
+Not logged: the P1's own internal temperature - its frames carry two
+metadata rows, but their layout isn't documented in `p3_camera.py`/
+`P3_PROTOCOL.md` and a guess could log a plausible-looking wrong number. If
+you know the layout (or want to reverse-engineer it), it would be the most
+direct reading of the camera's own heating. Ambient/enclosure air temperature
+needs an external sensor (e.g. a DS18B20 or I2C BME280 on the Pi's GPIO),
+which would be a small addition to `health_monitor.py` if you add one.
+
+### Static objects and `--stationary-timeout-seconds`
+
+`detect_stream.py`'s `freeze_update` (keep detected pixels out of the
+background, so an animal that stops doesn't fade into the scene and lose its
+track) has no time limit, so anything *static* that gets detected once is
+detected forever. Overnight runs saw single tracks of 16 and 52 hours at
+0.0px/s, always in the bottom-right corner of the frame (a warm fixture, not
+the burned-in timestamp: the detector runs on the raw camera frame, and the
+timestamp/boxes are drawn onto a copy afterwards, so it never sees them).
+That held the RGB trigger on - one clip grew to 35,500 seconds / ~46GB - and
+slowly inflated detection time (2.6 -> ~5ms over 3 days) as stuck tracks
+accumulated. `LiveDetector` now ends a track that hasn't moved for
+`--stationary-timeout-seconds` (default 20, 0 disables) and copies the
+current frame into the background over its box, so it stops re-triggering; an
+animal that genuinely sits still that long is absorbed too, and found again as
+soon as it moves. The vendored `detect_stream.py`/`track.py` are untouched.
+
 ### Field mode
 
 Same pattern as `p3-ir-camera`'s `field_mode.sh`/`normal_mode.sh`, pointed
@@ -364,6 +485,12 @@ Shared by both entry points:
 - `live_detection.py` - this project's adapter: wraps the vendored code's
   `StreamDetector`/`OnlineTracker` in a `LiveDetector.process(frame)` call
   suited to a persistent camera loop, plus an append-only JSONL event log.
+- `stats_logger.py` - the shared periodic-stats JSONL logger (captured fps,
+  detect time, free disk space, ...) all four capture loops use.
+- `health_monitor.py` - the heat/power indicators (CPU temperature, clock,
+  throttle/under-voltage flags, load) the two field loops add to their stats.
+- `rate_limiter.py` - the fixed-schedule frame thinner behind the record,
+  detect and publish gates (`--thermal-fps` / `--detect-fps`).
 
 `stream_server.py` (bench testing, live MJPEG preview):
 
@@ -420,6 +547,21 @@ For `field_recorder.py`:
   independent of the thermal one since the two cameras can be mounted at
   different angles) against the actual dual-camera bracket once it's built,
   rather than assuming the old single-camera rig's value.
+- An overnight test surfaced persistent, essentially-stationary tracks
+  lasting *hours* (peak boxes sitting right on a frame edge, near-zero
+  speed/displacement) - almost certainly a static hot spot at the frame
+  border that crossed the detection threshold once and then never aged out,
+  because `freeze_update` (by design) excludes currently-"detected" pixels
+  from updating the background, so a false positive gets the same
+  protection a genuinely paused animal does. Worth two things: checking the
+  actual footage at the reported frame/box coordinates to confirm it's a
+  fixture and not real activity, and noting that the *live* tracker (unlike
+  the offline `detect.py`/`track.py`, which has `max_edge_frac` and
+  `min_median_box_frac` specifically to reject this) has no edge-rejection
+  of its own - see WildMice/thermal_detect/README.md: "it is a trigger, not
+  a classifier." Masking a known-bad region, or porting a lightweight
+  edge/size check into `live_detection.py`, are both options if this
+  recurs.
 
 For both:
 

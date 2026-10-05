@@ -36,8 +36,11 @@ import usb.core
 from diskspace import free_space_mb
 from event_trigger import EventTrigger
 from live_detection import EventLogger, LiveDetector, StreamConfig, TrackConfig
-from p3_camera import FrameMarkerMismatchError, Model, P3Camera, get_model_config
+from p3_camera import FrameMarkerMismatchError, Model, P3Camera, get_model_config, raw_to_celsius
 from segment_writer import SegmentWriter, append_run_log
+from rate_limiter import RateLimiter
+from health_monitor import HealthMonitor
+from stats_logger import StatsLogger
 
 ERROR_RECONNECT_THRESHOLD = 20
 STATS_INTERVAL_SECONDS = 60.0
@@ -100,6 +103,8 @@ def run(
     stream_cfg: StreamConfig | None = None,
     track_cfg: TrackConfig | None = None,
     detections_log_path: str | None = "detections_events.jsonl",
+    stats_log_path: str | None = None,
+    stationary_timeout_s: float = 20.0,
 ):
     """Runs until stop_event is set, duration elapses, or disk space runs low."""
     outdir_path = Path(outdir)
@@ -116,27 +121,31 @@ def run(
 
     detector = None
     logger = None
-    detect_interval = 0.0
-    next_detect_due = time.time()
+    detect_gate = RateLimiter(detect_fps)
     overlay_boxes = []
     if enable_detection:
         det_w, det_h = (height, width) if rotate_degrees in (90, 270) else (width, height)
         detector = LiveDetector(det_w, det_h, stream_cfg or StreamConfig(),
-                                 track_cfg or TrackConfig(), fps=detect_fps)
-        detect_interval = 1.0 / detect_fps if detect_fps > 0 else 0.0
+                                 track_cfg or TrackConfig(), fps=detect_fps,
+                                 stationary_timeout_s=stationary_timeout_s)
         if detections_log_path:
             logger = EventLogger(detections_log_path)
         print(f"[thermal] detection enabled: {det_w}x{det_h} @ up to {detect_fps}fps "
               f"-> {detections_log_path or '(not logged)'}")
 
+    stats_logger = StatsLogger(stats_log_path) if stats_log_path else None
+    health_monitor = HealthMonitor("thermal")
+    log_write_failed = False  # rate-limits the "can't write detections" warning to once
+
     overall_start = time.time()
     consecutive_errors = 0
-    frame_interval = 1.0 / fps if fps > 0 else 0.0
-    next_frame_due = time.time()
+    record_gate = RateLimiter(fps)
 
     captured_count = 0
     detected_count = 0
     detect_time_total = 0.0
+    frame_error_count = 0   # cumulative; lets a stall in the stats be traced to the camera
+    reconnect_count = 0
     last_stats_time = time.time()
 
     try:
@@ -156,6 +165,7 @@ def run(
             segment.open()
             segment_deadline = time.time() + segment_seconds
             give_up = False
+            low_space = False
 
             while (
                 not stop_event.is_set()
@@ -173,7 +183,9 @@ def run(
 
                 if ir_brightness is None or thermal_raw is None:
                     consecutive_errors += 1
+                    frame_error_count += 1
                     if consecutive_errors >= ERROR_RECONNECT_THRESHOLD:
+                        reconnect_count += 1
                         print(f"[thermal] {consecutive_errors} consecutive frame errors; "
                               "reconnecting...")
                         try:
@@ -193,8 +205,7 @@ def run(
                 captured_count += 1
                 now = time.time()
 
-                if detector is not None and now >= next_detect_due:
-                    next_detect_due = max(now, next_detect_due) + detect_interval
+                if detector is not None and detect_gate.ready(now):
                     code = ROTATE_CODES[rotate_degrees]
                     det_frame = ir_brightness if code is None else cv2.rotate(ir_brightness, code)
                     t0 = time.perf_counter()
@@ -204,40 +215,94 @@ def run(
                     trigger.set_active(bool(overlay_boxes), now)
                     if logger is not None:
                         for ev in events:
-                            logger.log(ev, now)
+                            try:
+                                logger.log(ev, now)
+                            except OSError as e:
+                                if not log_write_failed:
+                                    print(f"[thermal] could not write to detections log "
+                                          f"({e!r}); further failures won't be reported "
+                                          "again until this one clears.")
+                                    log_write_failed = True
+                            else:
+                                log_write_failed = False
 
                 if now - last_stats_time >= STATS_INTERVAL_SECONDS:
                     elapsed = now - last_stats_time
                     avg_detect_ms = (detect_time_total / detected_count * 1000) if detected_count else 0.0
+                    captured_fps = captured_count / elapsed
+                    detected_fps = detected_count / elapsed
+                    free_mb = free_space_mb(outdir_path)
+                    health = health_monitor.sample()
+                    n_tracks = detector.active_track_count if detector is not None else 0
+                    # What the camera is looking at, from the latest raw frame: a hot
+                    # enclosure/fixture in view shows up here. Relative, not calibrated.
+                    scene_c = raw_to_celsius(thermal_raw)
+                    scene_mean_c = round(float(scene_c.mean()), 1)
+                    scene_max_c = round(float(scene_c.max()), 1)
                     print(
-                        f"[thermal] stats: {captured_count / elapsed:.1f} captured fps, "
-                        f"{detected_count / elapsed:.1f} detected fps, "
-                        f"{avg_detect_ms:.1f} ms/detect avg"
+                        f"[thermal] stats: {captured_fps:.1f} captured fps, "
+                        f"{detected_fps:.1f} detected fps, "
+                        f"{avg_detect_ms:.1f} ms/detect avg, {n_tracks} active tracks, "
+                        f"{free_mb:.0f}MB free, scene {scene_mean_c}/{scene_max_c}C mean/max, "
+                        f"{HealthMonitor.brief(health)}"
                     )
+                    if stats_logger is not None:
+                        try:
+                            stats_logger.log(
+                                captured_fps=round(captured_fps, 2),
+                                detected_fps=round(detected_fps, 2),
+                                avg_detect_ms=round(avg_detect_ms, 2),
+                                active_tracks=n_tracks,
+                                free_disk_mb=round(free_mb, 1),
+                                scene_mean_c=scene_mean_c,
+                                scene_max_c=scene_max_c,
+                                frame_errors=frame_error_count,
+                                reconnects=reconnect_count,
+                                **health,
+                            )
+                        except OSError:
+                            pass  # the free-space check right below will stop recording anyway
                     captured_count = 0
                     detected_count = 0
                     detect_time_total = 0.0
                     last_stats_time = now
 
-                if frame_interval <= 0 or now >= next_frame_due:
-                    segment.write(ir_brightness, thermal_raw, overlay_boxes=overlay_boxes)
-                    next_frame_due += frame_interval
-                    if next_frame_due < now:
-                        # Fell behind (e.g. right after a reconnect stall); resync
-                        # instead of bursting out queued frames back-to-back.
-                        next_frame_due = now + frame_interval
+                    if free_mb < min_free_mb:
+                        print(f"[thermal] free space below {min_free_mb}MB mid-segment; "
+                              "stopping recording to avoid filling the disk.")
+                        low_space = True
+                        break
 
-            meta = segment.close()
-            append_run_log(run_log_path, meta)
+                if record_gate.ready(now):
+                    segment.write(ir_brightness, thermal_raw, overlay_boxes=overlay_boxes)
+
+            try:
+                meta = segment.close()
+                append_run_log(run_log_path, meta)
+            except OSError as e:
+                print(f"[thermal] could not finalize segment metadata ({e!r}); continuing.")
             if give_up:
                 print("[thermal] could not reconnect within --max-reconnect-seconds; stopping.")
+                break
+            if low_space:
                 break
     finally:
         if detector is not None and logger is not None:
             for ev in detector.flush():
-                logger.log(ev, time.time())
+                try:
+                    logger.log(ev, time.time())
+                except OSError as e:
+                    print(f"[thermal] could not write final detections on shutdown ({e!r}).")
         if logger is not None:
-            logger.close()
+            try:
+                logger.close()
+            except OSError:
+                pass
+        if stats_logger is not None:
+            try:
+                stats_logger.close()
+            except OSError:
+                pass
         trigger.set_active(False)
         try:
             camera.stop_streaming()

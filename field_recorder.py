@@ -51,13 +51,13 @@ Arguments:
       segment_writer.py. Default: avi (XVID).
   --thermal-fps N
       Thermal video frame rate; frames from the camera (native ~25-27fps
-      for the P1, regardless of this) are thinned down to this rate. A
-      target that isn't an exact sub-multiple of the native rate gets
-      rounded down to the nearest one actually achievable (e.g. 10 becomes
-      a steady 8.33fps from a 25fps source); a warning is printed at
-      startup when this would happen. 12.5 (the default) is an exact half
-      of the assumed 25fps native rate, so it's delivered exactly with no
-      rounding. Default: 12.5.
+      for the P1, regardless of this) are thinned down to this rate. The
+      average is exact for any target up to the native rate (see
+      rate_limiter.py), but a frame can only be taken on a camera tick: a
+      target that isn't a whole divisor of 25 (e.g. 10) gives uneven
+      spacing - frames alternately 2 and 3 ticks (80/120ms) apart - and a
+      [note] is printed at startup when that applies. 12.5 (the default)
+      is exactly every 2nd frame, evenly spaced. Default: 12.5.
   --segment-seconds N
       Length of each thermal segment file, so a crash/power-loss only costs
       the in-progress segment. Default: 3600 (1 hour).
@@ -133,12 +133,36 @@ Arguments:
   --detect-fps N
       Rate the thermal stream (native ~25-27fps) is thinned down to before
       being fed to the detector - see the --thermal-fps note above about
-      rounding (the same warning applies here). Defaults to whatever
-      --thermal-fps ends up being, so the saved video and the detector see
-      the same frames unless set independently.
+      spacing (the same applies here). Defaults to whatever --thermal-fps
+      ends up being, so the saved video and the detector see the same
+      frames unless set independently.
+  --stationary-timeout-seconds N
+      A tracked object that hasn't moved (centroid within ~8% of the frame
+      diagonal) for this long is ended and folded into the background, so
+      it stops re-triggering. Without it, a *static* thing that gets
+      detected once (a fixture warming in the sun) is detected forever,
+      because the detector deliberately keeps detected pixels out of its
+      background so a resting animal doesn't vanish - overnight tests saw
+      single tracks last 16-52 hours, holding the RGB trigger on (one RGB
+      clip grew to ~46GB). An animal that genuinely sits still this long
+      is absorbed too, and detected again as soon as it moves. 0
+      disables. Default: 20.
   --detections-log PATH
       JSON-lines file finished detection events are appended to. Default:
-      detections_events.jsonl.
+      detections_events.jsonl inside --rgb-outdir.
+  --no-stats-log
+      Disable the periodic stats JSON-lines logs below. On by default -
+      one short line per subsystem per minute, negligible cost.
+  --thermal-stats-log PATH
+      JSON-lines log of the thermal/detection stats line that's also
+      printed every 60s (captured fps, detected fps, mean detect time,
+      free disk space on --thermal-outdir) - this is what would have
+      shown the SD card filling up during a run nobody was watching live.
+      Default: stats.jsonl inside --thermal-outdir.
+  --rgb-stats-log PATH
+      Same idea for the RGB side (captured fps, whether a clip is
+      currently open, free disk space on --rgb-outdir). Default:
+      stats.jsonl inside --rgb-outdir.
 
   Detection tuning (detect_stream.py's StreamConfig - see live_detection.py
   and WildMice/thermal_detect/README.md's "Real-time detection on the
@@ -221,7 +245,10 @@ Arguments:
 import argparse
 import math
 import signal
+import sys
 import threading
+import traceback
+from pathlib import Path
 
 import rgb_event_recorder
 import thermal_field_recorder
@@ -235,37 +262,45 @@ from p3_camera import Model
 # bench-testing one).
 LIVE_TRACK_FIELDS = ["merge_gap", "max_dist_frac", "iou_weight", "max_age", "process_var", "measure_var"]
 
-# The P1's documented native rate ("~25-27fps") - used only to warn when a requested
-# --thermal-fps/--detect-fps will actually be rounded down to something else. This is
-# a nominal assumption, not a measurement of the connected camera (see thermal_field_
-# recorder.py's own stats line for the real, measured captured fps of a given unit).
+# The P1's documented native rate ("~25-27fps") - used only to flag when a requested
+# --thermal-fps/--detect-fps won't give evenly spaced frames. A nominal assumption,
+# not a measurement of the connected camera (see the stats line for the real one).
 NOMINAL_NATIVE_FPS = 25.0
 
 
-def _warn_if_fps_needs_rounding(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
-    """--thermal-fps/--detect-fps both work by waiting until due on every native-rate
-    capture tick (see thermal_field_recorder.py) - a target that isn't an exact whole
-    sub-multiple of the native rate gets silently rounded down to the nearest one that
-    is, not delivered exactly (e.g. 10 against a 25fps native rate becomes a steady
-    8.33fps, not 10.0 - every 3rd captured frame, since 100ms isn't a whole multiple of
-    the ~40ms native tick). Warn about that up front instead of leaving it to be
-    discovered in the stats line.
+def _note_if_fps_uneven(flag: str, target_fps: float, native_fps: float = NOMINAL_NATIVE_FPS) -> None:
+    """The average rate of --thermal-fps/--detect-fps is exact for any target up to the
+    camera's rate (rate_limiter.py keeps a fixed schedule), but a frame can only be
+    taken on a capture tick: if the target isn't a whole divisor of the native rate
+    (e.g. 10 from 25fps) the spacing alternates between two tick multiples (80 and
+    120ms) instead of being constant. Worth knowing for the saved video's timing,
+    so say so up front.
     """
     if not (0 < target_fps < native_fps):
-        return  # 0 (unthrottled) or >= native rate: nothing to round
+        return  # 0 (unthrottled) or >= native rate: nothing to thin
     ticks = native_fps / target_fps
-    rounded_ticks = math.ceil(ticks - 1e-9)
-    if abs(ticks - rounded_ticks) > 1e-6:
-        achieved = native_fps / rounded_ticks
-        exact_examples = ", ".join(
-            f"{native_fps / n:g}" for n in (1, 2, 3, 4, 5) if native_fps / n < native_fps
-        )
+    if abs(ticks - round(ticks)) > 1e-6:
+        lo, hi = math.floor(ticks), math.ceil(ticks)
         print(
-            f"[warning] {flag} {target_fps:g} is not an exact sub-multiple of the P1's "
-            f"assumed ~{native_fps:g}fps native rate: it will actually run at a steady "
-            f"~{achieved:.2f}fps (every {rounded_ticks} captured frames), not "
-            f"{target_fps:g}. Exact sub-multiples ({exact_examples}, ...) avoid this."
+            f"[note] {flag} {target_fps:g} isn't a whole divisor of the P1's assumed "
+            f"~{native_fps:g}fps: the average will be {target_fps:g}fps, but frames will be "
+            f"spaced unevenly ({lo} or {hi} camera frames apart, ~{lo * 1000 / native_fps:.0f} "
+            f"or ~{hi * 1000 / native_fps:.0f}ms). Whole divisors ({native_fps / 2:g}, "
+            f"{native_fps / 3:.2f}, {native_fps / 4:g}, {native_fps / 5:g}, ...) are evenly spaced."
         )
+
+
+def _guarded(fn, name, crashes):
+    """Wrap a thread target so an unhandled exception is printed with its traceback
+    and recorded in `crashes` (for the exit code), rather than only vanishing the thread."""
+    def runner(**kwargs):
+        try:
+            fn(**kwargs)
+        except Exception:
+            print(f"[field-recorder] {name} crashed:")
+            traceback.print_exc()
+            crashes.append(name)
+    return runner
 
 
 def _add_config_args(group, cfg_instance, fields=None):
@@ -305,8 +340,8 @@ def parse_args():
         "--thermal-fps", type=float, default=12.5,
         help="Thermal video frame rate; frames from the camera (native ~25-27fps for the P1, "
         "regardless of this) are thinned down to this rate. 12.5 is an exact half of the "
-        "P1's nominal 25fps, so it's delivered exactly rather than rounded - see "
-        "--detect-fps. Default: 12.5.",
+        "P1's nominal 25fps, so it's evenly spaced (any target's *average* is exact). "
+        "Default: 12.5.",
     )
     thermal_group.add_argument(
         "--segment-seconds", type=float, default=3600.0,
@@ -386,7 +421,32 @@ def parse_args():
         help="Rate the thermal stream is thinned down to before being fed to the "
         "detector. Defaults to whatever --thermal-fps ends up being.",
     )
-    detect_group.add_argument("--detections-log", default="detections_events.jsonl")
+    detect_group.add_argument(
+        "--stationary-timeout-seconds", type=float, default=20.0,
+        help="End a tracked object that hasn't moved for this long and fold it into the "
+        "background so it stops re-triggering (0 disables). Default: 20.",
+    )
+    detect_group.add_argument(
+        "--detections-log", default=None,
+        help="JSON-lines file finished detection events are appended to. Default: "
+        "detections_events.jsonl inside --rgb-outdir.",
+    )
+    detect_group.add_argument(
+        "--no-stats-log", action="store_true",
+        help="Disable the periodic captured/detected-fps, detect-time, and free-disk-space "
+        "JSON-lines logs (one per subsystem - see --thermal-stats-log/--rgb-stats-log). "
+        "On by default and cheap (one line per minute); this is for when even that's unwanted.",
+    )
+    detect_group.add_argument(
+        "--thermal-stats-log", default=None,
+        help="JSON-lines file the thermal/detection stats line (also printed every 60s) is "
+        "appended to. Default: stats.jsonl inside --thermal-outdir.",
+    )
+    detect_group.add_argument(
+        "--rgb-stats-log", default=None,
+        help="JSON-lines file the RGB capture stats line is appended to. Default: "
+        "stats.jsonl inside --rgb-outdir.",
+    )
 
     stream_group = parser.add_argument_group(
         "detection tuning (detect_stream.py)",
@@ -407,8 +467,19 @@ def main():
 
     if args.detect_fps is None:
         args.detect_fps = args.thermal_fps
-    _warn_if_fps_needs_rounding("--thermal-fps", args.thermal_fps)
-    _warn_if_fps_needs_rounding("--detect-fps", args.detect_fps)
+    _note_if_fps_uneven("--thermal-fps", args.thermal_fps)
+    _note_if_fps_uneven("--detect-fps", args.detect_fps)
+
+    if args.detections_log is None:
+        args.detections_log = str(Path(args.rgb_outdir) / "detections_events.jsonl")
+    if args.no_stats_log:
+        args.thermal_stats_log = None
+        args.rgb_stats_log = None
+    else:
+        if args.thermal_stats_log is None:
+            args.thermal_stats_log = str(Path(args.thermal_outdir) / "stats.jsonl")
+        if args.rgb_stats_log is None:
+            args.rgb_stats_log = str(Path(args.rgb_outdir) / "stats.jsonl")
 
     stream_cfg = StreamConfig(**{f: getattr(args, f) for f in vars(StreamConfig())})
     track_cfg = TrackConfig(**{f: getattr(args, f) for f in LIVE_TRACK_FIELDS})
@@ -419,9 +490,10 @@ def main():
 
     trigger = EventTrigger()
     threads = []
+    crashes = []   # names of worker threads that died from an exception (exit code 1)
 
     thermal_thread = threading.Thread(
-        target=thermal_field_recorder.run,
+        target=_guarded(thermal_field_recorder.run, "thermal-field-recorder", crashes),
         kwargs=dict(
             trigger=trigger,
             stop_event=stop_event,
@@ -446,6 +518,8 @@ def main():
             stream_cfg=stream_cfg,
             track_cfg=track_cfg,
             detections_log_path=args.detections_log,
+            stats_log_path=args.thermal_stats_log,
+            stationary_timeout_s=args.stationary_timeout_seconds,
         ),
         daemon=True,
         name="thermal-field-recorder",
@@ -455,7 +529,7 @@ def main():
 
     if not args.no_rgb and not args.no_detect:
         rgb_thread = threading.Thread(
-            target=rgb_event_recorder.run,
+            target=_guarded(rgb_event_recorder.run, "rgb-event-recorder", crashes),
             kwargs=dict(
                 trigger=trigger,
                 stop_event=stop_event,
@@ -469,6 +543,7 @@ def main():
                 pre_roll_seconds=args.pre_roll_seconds,
                 post_roll_seconds=args.post_roll_seconds,
                 min_free_mb=args.rgb_min_free_mb,
+                stats_log_path=args.rgb_stats_log,
             ),
             daemon=True,
             name="rgb-event-recorder",
@@ -480,10 +555,22 @@ def main():
               "(nothing would ever trigger it).")
 
     print("[field-recorder] running. Ctrl+C or SIGTERM to stop.")
-    stop_event.wait()
+    # Watchdog: a worker thread ending while nobody asked to stop (a crash, the camera
+    # giving up, low disk space, --duration elapsing) used to leave the process idling
+    # forever - an RGB thread killed by one exception at the start of an MJPG test
+    # went unnoticed for three days. Shut everything down instead, so it's obvious and
+    # a supervisor (systemd Restart=always, as in field-recorder.service) can restart
+    # it cleanly, like record_p1_segmented.py's reconnect-then-exit design.
+    while not stop_event.wait(timeout=5.0):
+        ended = [t.name for t in threads if not t.is_alive()]
+        if ended:
+            print(f"[field-recorder] {', '.join(ended)} stopped on its own (see above for "
+                  "why); shutting everything down.")
+            stop_event.set()
     print("\n[field-recorder] stopping...")
     for t in threads:
         t.join(timeout=30)
+    sys.exit(1 if crashes else 0)
 
 
 if __name__ == "__main__":
