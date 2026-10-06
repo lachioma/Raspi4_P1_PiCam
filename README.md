@@ -294,18 +294,22 @@ tedious - see "What's next").
 
 ### Disk, CPU, and RAM budget
 
-**RAM**: the RGB pre-roll buffer is the only new memory cost, and it's
-small: at the defaults (640x480 BGR @ 15fps, 2s pre-roll) that's
-`640 x 480 x 3 bytes x 15fps x 2s` ≈ 27MB. Trivial on any Pi 4 (1GB+).
+**RAM**: the RGB pre-roll buffer is the main memory cost: raw BGR frames,
+`width x height x 3 bytes x fps x pre-roll seconds` - ≈ 27MB at the 640x480 @
+15fps defaults, but ≈ 360MB at 1640x1232 @ 30fps. A clip being encoded can add
+up to ~90 more queued frames (~540MB) if the encoder falls behind, after which
+frames are dropped rather than memory growing. Fine on a 2GB+ Pi 4, worth
+checking on a 1GB one.
 
 **CPU**: detection's own cost was already measured on real hardware during
 the step-2 endurance test - see the "Real-time detection" section's stats
 line and WildMice's own benchmark (0.24ms/frame on their server, 30-80x
 headroom estimated on a Pi 4). Recording is comparatively cheap: the
 thermal segment writer only handles 160x120 frames, and the RGB event
-writer only runs `cv2.VideoWriter` while a clip is actually open (i.e.
-rarely, unless the camera is pointed at constant activity) - it is not a
-continuous cost like detection is.
+writer only encodes while a clip is actually open (i.e. rarely, unless the
+camera is pointed at constant activity) - it is not a continuous cost like
+detection is. What the idle RGB loop does cost is capturing and buffering 30
+raw frames a second (the recorder as a whole sits around 0.6 of one core).
 
 **Disk - the part that actually needs sizing.** Two independent write
 streams, deliberately given different growth characteristics:
@@ -396,16 +400,66 @@ encoder's own cost. The encode time also stepped up from ~49 to ~69ms
 tripled from ~2.3 to ~7GB/hour: the scene getting dark - a noisier image is
 both slower to encode and much bigger. Budget RGB disk at *night* rates.
 
-`--rgb-format avi-mjpg` (motion-JPEG) is the cheaper-to-encode alternative,
-but note it silently failed until recently: the saved file got the extension
-`.avi-mjpg`, which OpenCV can't map to a container, so `VideoWriter` never
-opened and (with an exception nothing caught) the RGB thread died on the
-first event - a 3-day run produced no RGB clips at all. Fixed: it now writes
-a normal `.avi`, a failed open is logged and retried instead of killing the
-thread, and `field_recorder.py` exits (so systemd can restart it) if either
-worker thread ends unexpectedly. A hardware-encoded path via picamera2's own
-H.264 encoder would be the most efficient fix but is a larger architectural
-change, not yet implemented.
+`--rgb-format avi-mjpg` (motion-JPEG through `cv2.VideoWriter`) silently
+failed until recently: the saved file got the extension `.avi-mjpg`, which
+OpenCV can't map to a container, so `VideoWriter` never opened and (with an
+exception nothing caught) the RGB thread died on the first event - a 3-day run
+produced no RGB clips at all. Fixed: it now writes a normal `.avi`, a failed
+open is logged and retried instead of killing the thread, and
+`field_recorder.py` exits (so systemd can restart it) if either worker thread
+ends unexpectedly. Once it worked it turned out not to be faster: **~60ms per
+frame** (vs 48ms for XVID by day), so ~15-16fps - ffmpeg's MJPEG encoder
+behind `VideoWriter` is nothing like the 22.5ms `cv2.imencode` that the
+streaming path measured at the same size.
+
+### RGB clip encoding: why the default is `avi-jpeg`
+
+That MJPG run also exposed a worse problem, in how *any* `VideoWriter` format
+behaves at this size. The three clips it wrote had 61, 62 and 118 frames -
+and the pre-roll alone is ~60 frames (2s at 30fps). Opening a clip wrote that
+whole backlog synchronously, ~60 frames x 60ms = **~3.6s with capture
+blocked**, so the live frames of the event were never captured, and by the
+time the loop resumed the post-roll had already elapsed and the clip closed:
+short events were saved as *only the pre-roll plus a frame or two*. (The same
+shape showed in the earlier XVID clips: 67 frames in 3.56s.) On top of that
+the writer declared 30fps while holding ~16, so playback ran ~1.8x fast.
+
+`--rgb-format avi-jpeg` (the default; `mjpeg_avi.py`) fixes both without
+needing anything that wasn't already measured on this Pi:
+
+- each frame is encoded with `cv2.imencode` (22.5ms at 1640x1232) on a pool of
+  `--rgb-encode-threads` workers (default 3; `imencode` releases the GIL), and
+  one writer thread puts the JPEGs into an AVI in capture order. Capture never
+  waits - submitting a frame is a queue append - so the pre-roll backlog is
+  encoded while live capture carries on, and the clip really holds pre-roll,
+  event and post-roll;
+- timing is kept honest: every frame is placed on a fixed 1/fps grid by its
+  capture timestamp. A gap is filled by repeating the previous JPEG (free), a
+  second frame in an already-filled slot is skipped, so playback is real-time
+  whatever the camera delivered. Both counts, plus any frames dropped because
+  the backlog was full, are in the clip's `.json` sidecar;
+- the AVI is a small hand-written container (one `MJPG` stream plus an `idx1`
+  index) rather than OpenCV's writer, which would mean re-encoding. A clip over
+  ~1.8GB rolls into `<name>_part2.avi`, `_part3.avi`, ...;
+- `clip_started_at` in the sidecar is now the capture time of the earliest
+  frame (pre-roll included), so `duration_seconds` is the real length of the
+  footage rather than the time since the trigger.
+
+Trade-offs, honestly: idle cost is unchanged (the pre-roll buffer is still raw
+frames, ~6MB each, ~360MB for 2s at 1640x1232 - the earlier "27MB" figure was
+for the 640x480 defaults), but while a clip is open the encodes cost about 0.7
+of a core (30 x 22.5ms), briefly more while the backlog is encoded. File size
+is **not yet measured**: JPEG-per-frame has no inter-frame compression, so
+expect clips several times larger than XVID's for the same footage, scaling
+strongly with `--rgb-jpeg-quality` (default 75) - check `free_disk_mb` in the
+RGB stats log over a first event and set quality/`--rgb-min-free-mb`
+accordingly. The picamera2 hardware H.264 encoder with its circular buffer
+would be far lighter on CPU and disk (the Pi 4's encoder handles widths up to
+~2048, so 1640x1232 should work, 3280x2464 not) but needs ffmpeg for a
+playable container and a rewrite around picamera2's own encoder pipeline; it
+remains the option to reach for if JPEG's CPU or disk cost proves a problem.
+`mjpeg_avi_test.py` checks the container and the time-grid logic on the Pi
+(`python3 mjpeg_avi_test.py`).
 
 ### RGB resolution vs. fps: what the Pi 4 sustains
 
@@ -575,8 +629,10 @@ Shared by both entry points:
 - `event_trigger.py` - the thread-safe active/last-active-time signal
   described above.
 - `rgb_event_recorder.py` - Camera Module 2 capture with a rolling pre-roll
-  buffer and an event-triggered `cv2.VideoWriter` (pre/post-roll), driven
-  by `EventTrigger`.
+  buffer and event-triggered clips (pre/post-roll), driven by `EventTrigger`.
+- `mjpeg_avi.py` - the default clip encoder: parallel `cv2.imencode` JPEGs
+  written into an AVI on a fixed time grid (see "RGB clip encoding");
+  `mjpeg_avi_test.py` checks it.
 - `thermal_field_recorder.py` - thermal capture loop: continuous
   `SegmentWriter` recording, continuous detection, `EventTrigger` updates,
   and JSONL event logging, all on one frame stream.

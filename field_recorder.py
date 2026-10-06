@@ -95,8 +95,26 @@ Arguments:
       recordings_rgb_events.
   --rgb-prefix NAME
       Filename prefix for each RGB clip. Default: rgb_event.
-  --rgb-format {avi,avi-mjpg,mp4}
-      Video container/codec for RGB clips. Default: avi (XVID).
+  --rgb-format {avi-jpeg,avi,avi-mjpg,mp4}
+      How RGB clips are encoded. avi-jpeg (default): one JPEG per frame
+      (cv2.imencode, ~22ms at 1640x1232), encoded in parallel on a few
+      threads and written into an AVI by mjpeg_avi.py. Capture never waits
+      on it, so a clip holds the pre-roll, the event and the post-roll at
+      the camera's frame rate, and plays back in real time. The others go
+      through cv2.VideoWriter (avi = XVID, avi-mjpg, mp4 = mp4v): they're
+      synchronous and slower than 30fps at 1640x1232 on a Pi 4 (XVID
+      48-69ms/frame, MJPG ~60ms), so opening a clip stalls capture while
+      the pre-roll backlog is encoded, short events lose the event itself,
+      and the clip declares 30fps while holding ~16 (plays ~1.8x fast).
+      Kept for comparison. Default: avi-jpeg.
+  --rgb-jpeg-quality N
+      JPEG quality (1-100) for avi-jpeg clips. Clip size scales strongly
+      with it - measure with your scene (check free_disk_mb in the RGB
+      stats log) before a long deployment. Default: 75.
+  --rgb-encode-threads N
+      Frames encoded at once for avi-jpeg. One encode is ~22ms at 1640x1232
+      against a 33ms frame interval, so 3 gives comfortable headroom (the
+      pre-roll backlog included) on the Pi 4's 4 cores. Default: 3.
   --rgb-width N
       RGB capture width, in pixels. Default: 640.
   --rgb-height N
@@ -392,7 +410,20 @@ def parse_args():
     )
     rgb_group.add_argument("--rgb-outdir", default="recordings_rgb_events")
     rgb_group.add_argument("--rgb-prefix", default="rgb_event")
-    rgb_group.add_argument("--rgb-format", choices=["avi", "avi-mjpg", "mp4"], default="avi")
+    rgb_group.add_argument(
+        "--rgb-format", choices=list(rgb_event_recorder.FORMATS), default=rgb_event_recorder.JPEG_FORMAT,
+        help="How RGB clips are encoded. avi-jpeg (default) encodes JPEG frames in parallel "
+        "and never stalls capture; the others use cv2.VideoWriter and can't keep up with "
+        "30fps at 1640x1232 on a Pi 4 - see the docstring.",
+    )
+    rgb_group.add_argument(
+        "--rgb-jpeg-quality", type=int, default=75,
+        help="JPEG quality (1-100) for avi-jpeg clips; size scales strongly with it. Default: 75.",
+    )
+    rgb_group.add_argument(
+        "--rgb-encode-threads", type=int, default=3,
+        help="Frames encoded at once for avi-jpeg. Default: 3.",
+    )
     rgb_group.add_argument("--rgb-width", type=int, default=640)
     rgb_group.add_argument("--rgb-height", type=int, default=480)
     rgb_group.add_argument("--rgb-fps", type=float, default=15.0)
@@ -552,6 +583,8 @@ def main():
                 post_roll_seconds=args.post_roll_seconds,
                 min_free_mb=args.rgb_min_free_mb,
                 stats_log_path=args.rgb_stats_log,
+                jpeg_quality=args.rgb_jpeg_quality,
+                encode_threads=args.rgb_encode_threads,
             ),
             daemon=True,
             name="rgb-event-recorder",
