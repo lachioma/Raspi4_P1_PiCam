@@ -59,7 +59,7 @@ class LiveDetector:
     STATIONARY_RADIUS_FRAC = 0.08
 
     def __init__(self, width: int, height: int, cfg: StreamConfig, track_cfg: TrackConfig,
-                 fps: float, stationary_timeout_s: float = 20.0):
+                 fps: float, stationary_timeout_s: float = 60.0):
         """stationary_timeout_s: see _retire_stationary(); 0 disables it."""
         self.cfg = cfg
         self.fps = fps

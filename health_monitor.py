@@ -14,10 +14,15 @@ What is reported (one dict per sample, ready to splat into StatsLogger.log):
   other_temps_c         any further hwmon temperature sensors the kernel
                         exposes (e.g. a USB/NVMe SSD, a PoE HAT), by name.
   fans_rpm              any hwmon fan tachometers (official Pi fan/case).
-  cpu_freq_mhz          current CPU clock, and cpu_freq_max_mhz its ceiling: a
-                        clock sitting below the maximum under load is
-                        throttling caught in the act, even between samples
-                        of the firmware flags below.
+  cpu_freq_mhz          current clock of core 0, and cpu_freq_max_mhz its
+                        ceiling. One sample is only where the frequency
+                        governor happens to be that instant - an idle Pi
+                        bounces between ~600 and the maximum (readings of
+                        900, 1000 and 1800 MHz seconds apart at 54C are
+                        normal) - so this says nothing about throttling on
+                        its own. It matters only as a clock *stuck* below
+                        max while load_1m is high; the flags below are the
+                        reliable throttling indicator.
   throttled_now /
   throttled_since_boot  decoded `get_throttled` flags: under_voltage (supply
                         sagging - often mistaken for heat), freq_capped,

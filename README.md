@@ -407,6 +407,48 @@ worker thread ends unexpectedly. A hardware-encoded path via picamera2's own
 H.264 encoder would be the most efficient fix but is a larger architectural
 change, not yet implemented.
 
+### RGB resolution vs. fps: what the Pi 4 sustains
+
+Measured with `stream_server.py` (JPEG-encoding each frame for the MJPEG
+stream, no viewer needed - the encode runs regardless), `--rgb-fps 30`:
+
+| run | RGB captured fps | ms/capture | ms/encode (JPEG) |
+|---|---|---|---|
+| 1640x1232, RGB only | 29.9-30.0 | 10.4-10.7 | 22.4-22.6 |
+| 1640x1232, with thermal + detection | 30.0 | 10.2 | 22.7 |
+| 3280x2464, RGB only | 8.3-8.5 | 24.7-26.2 | 92.3-93.2 |
+
+- **1640x1232 @ 30fps streams fine, with ~30% to spare**: at 30fps the loop
+  has a 33ms budget, 22.5ms goes on encoding, and the remaining ~10ms shows up
+  as `ms/capture` (that is just waiting for the next frame). Running the
+  thermal camera and detection alongside changed nothing measurable (+0.2ms
+  encode; detection 1.8-1.9ms at 12.5 detected fps - which also confirms the
+  fixed-schedule rate limiter on hardware, where the old gate gave 10.0). JPEG
+  encoding is ~2x cheaper than the XVID video encoding of event clips was at
+  the same size (22.5 vs 48ms).
+- **3280x2464 cannot reach 30fps, and mostly not because of the Pi.** The
+  sensor's full-resolution mode tops out at **21.19fps** (see the
+  `sensor_modes` table in "Setup on the Raspberry Pi") - that is the camera's
+  CSI link, so 30fps there is impossible on any host. Only the 1640x1232
+  (81fps) and 1920x1080 (47.6fps) modes can do 30fps; any size larger than
+  those falls into the 21fps full-resolution mode. The Pi then limits it
+  further: encode time scales linearly with pixels (4.0x the pixels, 4.1x the
+  time, ~11ns/pixel), and `ms/capture` of ~25 here is real work (copying the
+  24MB BGR frame out of the camera buffer), not waiting. 25 + 92ms per frame
+  is the 8.5fps seen.
+- **Pi 4 has no hardware path for this size.** The Pi 4's hardware H.264
+  encoder stops at 1920x1080, and it has no hardware JPEG encoder at all.
+  What remains is software, and it could be made faster than 8.5fps - encoding
+  on several threads (OpenCV's `imencode` releases the GIL, and the Pi has four
+  cores), or asking picamera2 for a `YUV420` main stream and encoding that
+  directly (half the bytes, no BGR conversion) - but with the sensor's 21fps
+  ceiling and the memory bandwidth, something like 12-18fps is the plausible
+  best case, not 30, and it has not been tried. Each 8MP JPEG is also ~1.5-2MB,
+  so even 15fps is ~25MB/s for the viewer to decode.
+- **Practical choice:** use 1640x1232 for anything live (full field of view,
+  2x2 binned so it is also better in low light) and treat 3280x2464 as a
+  low-fps / still-image mode.
+
 ### Heat and power indicators
 
 For runs of days or weeks, both field stats logs (`health_monitor.py`) also
@@ -414,8 +456,10 @@ record, every minute: `cpu_temp_c` (the Pi 4 starts throttling at 80C; the
 "GPU" temperature `vcgencmd` shows is this same sensor), any further hwmon
 temperature sensors the kernel exposes (`other_temps_c` - an SSD, PoE HAT),
 fan speeds (`fans_rpm`), the CPU clock against its ceiling (`cpu_freq_mhz` /
-`cpu_freq_max_mhz` - a clock below max under load is throttling caught in the
-act), the firmware throttle flags decoded both for *now* (`throttled_now`)
+`cpu_freq_max_mhz` - one sample is just where the frequency governor happens
+to be that instant, so an idle Pi reads anything from 600 to the maximum;
+only a clock *stuck* below max while `load_1m` is high means anything), the
+firmware throttle flags decoded both for *now* (`throttled_now`)
 and *since boot* (`throttled_since_boot`, which latches so a one-sample
 glitch isn't missed) - `under_voltage` (a sagging supply, often mistaken for
 heat), `freq_capped`, `throttled`, `soft_temp_limit` - plus the raw
@@ -448,10 +492,26 @@ timestamp/boxes are drawn onto a copy afterwards, so it never sees them).
 That held the RGB trigger on - one clip grew to 35,500 seconds / ~46GB - and
 slowly inflated detection time (2.6 -> ~5ms over 3 days) as stuck tracks
 accumulated. `LiveDetector` now ends a track that hasn't moved for
-`--stationary-timeout-seconds` (default 20, 0 disables) and copies the
-current frame into the background over its box, so it stops re-triggering; an
-animal that genuinely sits still that long is absorbed too, and found again as
-soon as it moves. The vendored `detect_stream.py`/`track.py` are untouched.
+`--stationary-timeout-seconds` (default 60, 0 disables) and copies the
+current frame into the background over its box, so it stops re-triggering. The
+vendored `detect_stream.py`/`track.py` are untouched.
+
+**What "hasn't moved" means.** It does not require perfect stillness. The
+check uses the track's box *centre*, not individual pixels, and the track
+counts as stationary while that centre stays within a radius of about 8% of
+the frame diagonal - roughly 16 px on a 160x120 frame (the constant
+`STATIONARY_RADIUS_FRAC` in `live_detection.py`, not a command-line flag).
+The clock restarts whenever the centre leaves that circle. So an animal that
+feeds or grooms in place can be absorbed even though it is moving; it is
+detected again as soon as it moves out of the circle. The radius is the lever
+that matters more than the timeout: it is generous on purpose, because a
+fixture's box fluctuates by a few pixels and should still be caught reliably,
+so if real animals turn out to be ended early a smaller radius (4-6 px) is the
+better fix than a longer timeout. Every event ended this way carries
+`"ended_by": "stationary_timeout"` in `detections_events.jsonl`, so they can be
+reviewed against the video: a fixture appears as one long event ending exactly
+`--stationary-timeout-seconds` after its last movement, while anything that
+looks like an animal means the radius is too generous.
 
 ### Field mode
 

@@ -86,15 +86,23 @@ Arguments:
       ends up being, so the two see the same frames unless set
       independently.
   --stationary-timeout-seconds N
-      A tracked object that hasn't moved (centroid within ~8% of the frame
-      diagonal) for this long is ended and folded into the background, so
-      it stops re-triggering. Without it, a *static* thing that gets
-      detected once (a fixture warming in the sun) is detected forever,
-      because the detector deliberately keeps detected pixels out of its
-      background so a resting animal doesn't vanish - overnight tests saw
-      single tracks last 16-52 hours. An animal that genuinely sits still
-      this long is absorbed too, and detected again as soon as it moves.
-      0 disables. Default: 20.
+      A tracked object that hasn't moved for this long is ended and folded
+      into the background, so it stops re-triggering. Without it, a
+      *static* thing that gets detected once (a fixture warming in the
+      sun) is detected forever, because the detector deliberately keeps
+      detected pixels out of its background so a resting animal doesn't
+      vanish - overnight tests saw single tracks last 16-52 hours.
+      "Hasn't moved" does not mean perfectly still: the check uses the
+      track's box centre, not individual pixels, and the track counts as
+      stationary while that centre stays within a radius of about 8% of
+      the frame diagonal (roughly 16 px on a 160x120 frame; the constant
+      STATIONARY_RADIUS_FRAC in live_detection.py). The clock restarts
+      whenever the centre leaves that circle. So an animal feeding or
+      grooming in place can be absorbed even though it is moving; it is
+      detected again as soon as it moves out of the circle. Each event
+      ended this way carries "ended_by": "stationary_timeout" in the
+      detections log, to review against the video. 0 disables.
+      Default: 60.
   --detections-log PATH
       JSON-lines file finished detection events are appended to. Default:
       detections_events.jsonl.
@@ -318,9 +326,9 @@ def parse_args():
         "stream and the detector see the same frames unless set explicitly.",
     )
     parser.add_argument(
-        "--stationary-timeout-seconds", type=float, default=20.0,
+        "--stationary-timeout-seconds", type=float, default=60.0,
         help="End a tracked object that hasn't moved for this long and fold it into the "
-        "background so it stops re-triggering (0 disables). Default: 20.",
+        "background so it stops re-triggering (0 disables). Default: 60.",
     )
     parser.add_argument(
         "--detections-log", default="detections_events.jsonl",

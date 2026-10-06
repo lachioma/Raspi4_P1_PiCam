@@ -104,7 +104,7 @@ def run(
     track_cfg: TrackConfig | None = None,
     detections_log_path: str | None = "detections_events.jsonl",
     stats_log_path: str | None = None,
-    stationary_timeout_s: float = 20.0,
+    stationary_timeout_s: float = 60.0,
 ):
     """Runs until stop_event is set, duration elapses, or disk space runs low."""
     outdir_path = Path(outdir)
