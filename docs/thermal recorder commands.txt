@@ -1,0 +1,56 @@
+Go to the main folder of the thermal recorder:
+cd ~/p3-ir-camera/p3-ir-camera
+
+
+
+Start field mode.
+This starts acquisition with the parameters specified in thermal-recorder.service.
+Disable wifi, Bluetooth, and OS, to save energy.
+
+./field_mode.sh
+sudo reboot
+
+
+
+To interrupt acquisition and field mode
+cd ~/p3-ir-camera/p3-ir-camera
+./normal_mode.sh
+sudo reboot
+
+
+
+
+
+When you want to change the thermal-recorder.service, edit the file ~/p3-ir-camera/p3-ir-camera/thermal-recorder.service. Then run:
+
+sudo cp ~/p3-ir-camera/p3-ir-camera/thermal-recorder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart thermal-recorder.service
+sudo systemctl status thermal-recorder.service --no-pager
+
+Confirm it shows active (running) rather than failed
+
+
+If field_mode.sh or normal_mode.sh is changed, run this first, otherwise you get "permission denied" error:
+chmod +x field_mode.sh normal_mode.sh
+
+
+
+
+
+One-time setup needed for field-mode-net.service to work:
+
+sudo cp field-mode-net.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+After that, field_mode.sh/normal_mode.sh handle enabling/disabling it automatically on every future run — no need to repeat this unless you edit field-mode-net.service itself later (in which case, same as before: re-copy + daemon-reload).
+
+
+
+
+
+Activate virtual environment:
+source venv/bin/activate 
+
+
+

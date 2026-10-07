@@ -1,0 +1,5 @@
+sudo cp thermal-recorder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start thermal-recorder.service
+sudo systemctl status thermal-recorder.service
+journalctl -u thermal-recorder.service -f

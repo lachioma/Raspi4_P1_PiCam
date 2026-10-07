@@ -1,0 +1,275 @@
+File transfer between Raspberry Pi and Windows PC
+
+
+To transfer files from Raspberry Pi to a Windows PC, we can connect them via an Ethernet cable and create a little network between them. Then we can use WinSCP to transfer files between devices.
+
+Here below are the main instructions, summed up from https://chatgpt.com/share/6a99302e-2fac-83ed-a487-1ad906cb88ee
+
+
+
+
+On the Raspberry Pi, please run these one at a time:
+
+sudo ip link set eth0 up
+
+then:
+
+sudo ip addr add 192.168.50.2/24 dev eth0
+
+Then:
+
+ip addr show eth0
+
+You should see something like:
+
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> ...
+    inet 192.168.50.2/24 scope global eth0
+    inet6 fe80::a00a:bcb4:b8c2:84...
+
+
+This assign that IP to Raspberry Pi, but it is temporary, until next reboot!
+
+
+
+Give your Windows Ethernet adapter an IP in the same subnet
+
+On Windows:
+
+Open Settings → Network & Internet → Advanced network settings
+Click More network adapter options
+Right-click your Ethernet adapter → Properties
+Select Internet Protocol Version 4 (TCP/IPv4)
+Click Properties
+Select Use the following IP address
+
+Enter:
+
+IP address:      192.168.50.1
+Subnet mask:     255.255.255.0
+Default gateway: [leave blank]
+DNS server:      [leave blank]
+
+Click OK.
+
+This creates a tiny private network:
+
+Windows laptop                  Raspberry Pi
+192.168.50.1  ─── Ethernet ───  192.168.50.2
+
+No router or internet is necessary.
+
+
+
+
+
+Test it on Windows
+
+On Windows PowerShell:
+
+ping 192.168.50.2
+
+You should get replies.
+
+Then:
+
+Test-NetConnection 192.168.50.2 -Port 22
+
+You want:
+
+TcpTestSucceeded : True
+
+
+
+Connect with WinSCP
+
+Use:
+
+File protocol: SFTP
+Host name:     192.168.50.2
+Port:          22
+Username:      <your Raspberry Pi username>
+Password:      <your Pi password>
+
+Then click Login.
+
+
+
+
+
+
+======================================
+Make that IP permanent on Raspberry Pi
+======================================
+
+1. First, identify the Ethernet connection name
+
+On the Pi, run:
+
+nmcli connection show
+
+You'll probably see something like:
+
+NAME                UUID                                  TYPE      DEVICE
+Wired connection 1  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  ethernet  eth0
+
+The important part is the NAME — probably "Wired connection 1" or "netplan-eth0".
+
+2. Configure the static IP
+
+If the connection is indeed called "Wired connection 1", run:
+
+sudo nmcli connection modify "Wired connection 1" ipv4.method manual ipv4.addresses 192.168.50.2/24
+
+Because this is a direct Pi ↔ laptop connection, we do not need to specify a gateway or DNS server. This is intentional.
+Then reload the connection:
+
+sudo nmcli connection down "Wired connection 1"
+sudo nmcli connection up "Wired connection 1"
+
+Your Ethernet connection will briefly disappear and come back.
+
+
+Otherwise, if the connection is called "netplan-eth0", run:
+
+sudo nmcli connection modify "netplan-eth0" ipv4.method manual ipv4.addresses 192.168.50.2/24
+
+sudo nmcli connection down "netplan-eth0"
+sudo nmcli connection up "netplan-eth0"
+
+
+3. Verify
+
+Run:
+
+ip addr show eth0
+
+You should now see:
+
+inet 192.168.50.2/24
+
+You can also check NetworkManager:
+
+nmcli device show eth0
+
+Look for:
+
+IP4.ADDRESS[1]: 192.168.50.2/24
+
+4. Test from Windows
+
+Your Windows Ethernet adapter should still be configured as:
+
+IP address:   192.168.50.1
+Subnet mask:  255.255.255.0
+
+Then:
+
+ping 192.168.50.2
+
+and:
+
+Test-NetConnection 192.168.50.2 -Port 22
+
+You should get:
+
+TcpTestSucceeded : True
+
+WinSCP can then always use:
+
+SFTP
+192.168.50.2
+Port 22
+your-Pi-username
+your-Pi-password
+One important thing before we do it
+
+Don't reboot the Pi yet. First run:
+
+nmcli connection show
+
+and paste the output here. I want to make sure we modify the correct Ethernet connection rather than accidentally changing something associated with your Wi-Fi. This is especially worthwhile because Raspberry Pi OS networking has changed across recent releases.
+
+
+ale@raspberrypi:~ $ nmcli connection show
+NAME                UUID                                  TYPE      DEVICE 
+seewiesen           ee6b5d7b-6f8e-48a8-8db5-9e426f12684a  wifi      wlan0  
+Wired connection 1  344d9259-bd1a-3f1f-adfd-4845e1983b44  ethernet  eth0   
+lo                  043a6324-cc54-4377-aed5-1f58d6f4abd5  loopback  lo     
+NeuroGuest          e297facc-2a8c-4bc1-8a56-8c400cf6d71e  wifi      --    
+
+
+
+
+
+
+
+Run these commands on the Raspberry Pi.
+
+1. Set the permanent static IP
+sudo nmcli connection modify "Wired connection 1" ipv4.method manual ipv4.addresses 192.168.50.2/24
+
+Since this Ethernet connection is just for directly connecting to your Windows laptop, explicitly disable the default gateway and DNS on this connection:
+
+sudo nmcli connection modify "Wired connection 1" ipv4.never-default yes
+sudo nmcli connection modify "Wired connection 1" ipv6.method disabled
+
+Then activate the updated connection:
+
+sudo nmcli connection down "Wired connection 1"
+sudo nmcli connection up "Wired connection 1"
+2. Verify
+
+Run:
+
+ip addr show eth0
+
+You should see:
+
+inet 192.168.50.2/24
+
+You can also check with:
+
+nmcli device show eth0
+3. Test from Windows
+
+Make sure your Windows Ethernet adapter is still configured as:
+
+IP address:  192.168.50.1
+Subnet mask: 255.255.255.0
+
+Then in PowerShell:
+
+ping 192.168.50.2
+
+and:
+
+Test-NetConnection 192.168.50.2 -Port 22
+
+If everything is working, TcpTestSucceeded should be True.
+
+4. The real test: reboot the Pi
+
+Once the above works, reboot:
+
+sudo reboot
+
+After it restarts, reconnect the Ethernet cable and check:
+
+ip addr show eth0
+
+If you still see:
+
+inet 192.168.50.2/24
+
+then the IP is now permanent. Your WinSCP connection can always use:
+
+Host: 192.168.50.2
+Port: 22
+Protocol: SFTP
+Username: ale
+
+This configuration should also leave your seewiesen Wi-Fi connection alone, so the Pi can use Wi-Fi normally while eth0 remains your dedicated direct connection to the laptop.
+
+
+
+
