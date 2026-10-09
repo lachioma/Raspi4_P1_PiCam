@@ -1,10 +1,10 @@
-Go to the main folder of the thermal recorder:
-cd ~/p3-ir-camera/p3-ir-camera
+Go to the main folder of the field recorder:
+cd /home/ale/Code/Raspi4_P1_PiCam
 
 
 
 Start field mode.
-This starts acquisition with the parameters specified in thermal-recorder.service.
+This starts acquisition with the parameters specified in field-recorder.service.
 Disable wifi, Bluetooth, and OS, to save energy.
 
 ./field_mode.sh
@@ -13,7 +13,7 @@ sudo reboot
 
 
 To interrupt acquisition and field mode
-cd ~/p3-ir-camera/p3-ir-camera
+cd /home/ale/Code/Raspi4_P1_PiCam
 ./normal_mode.sh
 sudo reboot
 
@@ -21,14 +21,14 @@ sudo reboot
 
 
 
-When you want to change the thermal-recorder.service, edit the file ~/p3-ir-camera/p3-ir-camera/thermal-recorder.service. Then run:
+When you want to change the field-recorder.service, edit the local file /home/ale/Code/Raspi4_P1_PiCam/field-recorder.service. Then run:
 
-sudo cp ~/p3-ir-camera/p3-ir-camera/thermal-recorder.service /etc/systemd/system/
+sudo cp /home/ale/Code/Raspi4_P1_PiCam/field-recorder.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl restart thermal-recorder.service
-sudo systemctl status thermal-recorder.service --no-pager
+sudo systemctl restart field-recorder.service
+sudo systemctl status field-recorder.service --no-pager
 
-Confirm it shows active (running) rather than failed
+Confirm it shows active (running) rather than failed (code=exited).
 
 
 If field_mode.sh or normal_mode.sh is changed, run this first, otherwise you get "permission denied" error:
@@ -40,7 +40,7 @@ chmod +x field_mode.sh normal_mode.sh
 
 One-time setup needed for field-mode-net.service to work:
 
-sudo cp field-mode-net.service /etc/systemd/system/
+sudo cp /home/ale/Code/Raspi4_P1_PiCam/field-mode-net.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 After that, field_mode.sh/normal_mode.sh handle enabling/disabling it automatically on every future run — no need to repeat this unless you edit field-mode-net.service itself later (in which case, same as before: re-copy + daemon-reload).

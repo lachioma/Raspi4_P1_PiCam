@@ -7,15 +7,14 @@ Description=Raspi4 P1 + RGB camera field recorder (thermal + detection + RGB eve
 [Service]
 Type=simple
 User=ale
-WorkingDirectory=/home/ale/Raspi4_P1_PiCam
-# --thermal-rotate-degrees 180 matches the previous single-camera rig's
-# mounting; CONFIRM this against the actual dual-camera bracket before a
-# real deployment - it may not carry over.
-ExecStart=/home/ale/Raspi4_P1_PiCam/venv/bin/python3 field_recorder.py \
+WorkingDirectory=/home/ale/Code/Raspi4_P1_PiCam
+ExecStart=/home/ale/venv/bin/python3 field_recorder.py \
+    --thermal-outdir /home/ale/Code/Raspi4_P1_PiCam/recordings_20261008_thermal \
+    --rgb-outdir /home/ale/Code/Raspi4_P1_PiCam/recordings_20261008_rgb_events \
+    --thermal-fps 12.5 --segment-seconds 3600 \
     --thermal-rotate-degrees 180 \
-    --thermal-outdir /home/ale/Raspi4_P1_PiCam/recordings_thermal \
-    --rgb-outdir /home/ale/Raspi4_P1_PiCam/recordings_rgb_events \
-    --detections-log /home/ale/Raspi4_P1_PiCam/detections_events.jsonl
+    --rgb-width 1640 --rgb-height 1232 --rgb-fps 30 --rgb-format avi-jpeg \
+    --pre-roll-seconds 2 --post-roll-seconds 2
 Restart=always
 RestartSec=10
 # Give systemd time to deliver SIGTERM and let the current segment/clip
