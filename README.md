@@ -577,15 +577,33 @@ project doesn't depend on the other checkout being present on the Pi):
 ```bash
 sudo cp field-recorder.service field-mode-net.service /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl restart field-recorder.service
+sudo systemctl status field-recorder.service --no-pager
+```
+
+Confirm it shows active (running) rather than failed (code=exited).
+
+```bash
 ./field_mode.sh     # disables Wi-Fi/BT/Ethernet, switches to console boot, starts the recorder
 # ... later, to get the desktop and networking back for debugging ...
 ./normal_mode.sh
 ```
 
-**Before a real deployment**, check `field-recorder.service`'s
-`--thermal-rotate-degrees 180`: that value carried over from the
-single-camera rig's known mounting, and may not hold for the new
-dual-camera bracket.
+If field_mode.sh or normal_mode.sh is changed, run this first, otherwise you get `"permission denied"` error:
+
+```bash
+chmod +x field_mode.sh normal_mode.sh
+```
+
+When you want to change the field-recorder.service, edit the local file /Raspi4_P1_PiCam/field-recorder.service. Then run and confirm it shows active (running) rather than failed (code=exited):
+
+```bash
+sudo cp /home/ale/Code/Raspi4_P1_PiCam/field-recorder.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart field-recorder.service
+sudo systemctl status field-recorder.service --no-pager
+```
+
 
 ## Project layout
 
